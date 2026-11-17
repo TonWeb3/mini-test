@@ -129,6 +129,64 @@
                 </div>
             </div>
 
+            <!-- Long Shots -->
+            <div class="bg-gray-800 p-5 sm:p-6 rounded-lg shadow-lg">
+                <div class="flex items-center justify-between border-b border-gray-700 pb-2 mb-4">
+                    <div>
+                        <h2 class="text-lg sm:text-xl font-bold">Long Shots</h2>
+                        <p class="text-xs text-gray-400 mt-0.5">Final-minute sniper, resting maker bids, and engine long shots for cheap/high-multiple outcomes.</p>
+                    </div>
+                </div>
+
+                <div class="space-y-4">
+                    <!-- Exclusive Mode Toggle -->
+                    <div>
+                        <label class="flex items-center gap-3 bg-gray-700/80 border border-gray-600 rounded-lg p-3 text-white cursor-pointer hover:bg-gray-700 transition">
+                            <input type="checkbox" x-model="form.longshot.one_at_a_time" class="w-5 h-5 accent-emerald-500 rounded">
+                            <div>
+                                <span class="font-bold text-sm">One Longshot at a Time (Exclusive Mode)</span>
+                                <p class="text-[11px] text-gray-400">Only open/place ONE longshot order per window. If one longshot order is placed or active, any other longshot signals (Sniper, Maker, Engine) are ignored so it will not open multiple longshots simultaneously.</p>
+                            </div>
+                        </label>
+                    </div>
+                    <div class="mt-3" x-show="form.longshot.one_at_a_time">
+                        <label class="block text-gray-400 text-xs sm:text-sm mb-2 uppercase font-bold tracking-wider">What locks the window</label>
+                        <select x-model="form.longshot.one_at_a_time_rule" class="w-full bg-gray-700 border-none rounded-lg p-2.5 text-white">
+                            <option value="taken">A long shot taken: a sniper buy, engine buy, or maker fill</option>
+                            <option value="placed">The first order placed: a maker bid that only rests locks it too</option>
+                        </select>
+                    </div>
+
+                    <!-- Strategies -->
+                    <div class="pt-2">
+                        <label class="block text-gray-400 text-xs sm:text-sm mb-2 uppercase font-bold tracking-wider">Active Longshot Strategies</label>
+                        <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                            <label class="flex items-center gap-3 bg-gray-700 rounded-lg p-2.5 text-white cursor-pointer border border-emerald-500/50">
+                                <input type="checkbox" x-model="form.longshot.sniper_enabled" class="w-5 h-5 accent-emerald-500">
+                                <div>
+                                    <span class="font-bold text-sm">Sniper</span>
+                                    <p class="text-[11px] text-gray-400">Bands/EV taker buys in last 60s</p>
+                                </div>
+                            </label>
+                            <label class="flex items-center gap-3 bg-gray-700 rounded-lg p-2.5 text-white cursor-pointer border border-emerald-500/50">
+                                <input type="checkbox" x-model="form.longshot.maker_enabled" class="w-5 h-5 accent-emerald-500">
+                                <div>
+                                    <span class="font-bold text-sm">Maker</span>
+                                    <p class="text-[11px] text-gray-400">Resting post-only bids (1¢)</p>
+                                </div>
+                            </label>
+                            <label class="flex items-center gap-3 bg-gray-700 rounded-lg p-2.5 text-white cursor-pointer border border-emerald-500/50">
+                                <input type="checkbox" x-model="form.longshot.engine_enabled" class="w-5 h-5 accent-emerald-500">
+                                <div>
+                                    <span class="font-bold text-sm">Engine</span>
+                                    <p class="text-[11px] text-gray-400">GTD cheap entries (≤10¢)</p>
+                                </div>
+                            </label>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
             <!-- Auto-withdrawal (capital extractor) -->
             <div class="bg-gray-800 p-5 sm:p-6 rounded-lg shadow-lg">
                 <h2 class="text-lg sm:text-xl font-bold mb-4 border-b border-gray-700 pb-2">Auto-Withdrawal (Capital Extractor)</h2>
@@ -232,7 +290,7 @@
                     <div>
                         <label class="block text-gray-400 text-xs sm:text-sm mb-2 uppercase font-bold tracking-wider">Private Key or Seed Phrase</label>
                         <input type="password" x-model="form.private_key" class="w-full bg-gray-700 border-none rounded-lg p-3 text-white focus:ring-2 focus:ring-blue-500 transition" placeholder="0x...  or  twelve word seed phrase">
-                        <p class="text-[10px] text-gray-500 mt-2 italic">Your trading wallet is <strong>derived</strong> from this. It signs every order but holds no funds and needs no gas. A 12/24-word seed is converted to a hex key on save.</p>
+                        <p class="text-[10px] text-gray-500 mt-2 italic">Your trading wallet &amp; CLOB API credentials are <strong>derived</strong> from this. In <strong>Paper Mode</strong>, this key/seed authenticates to Polymarket's <strong>PolyBolt TWAP Price Stream</strong> so the bot gets the exact 60-second TWAP <strong>Price to Beat (Open)</strong> without placing live orders. A 12/24-word seed is converted to a hex key on save.</p>
                     </div>
                     <div class="grid grid-cols-1 md:grid-cols-2 gap-4 sm:gap-6">
                         <div>
@@ -407,7 +465,14 @@
                     live: { relayer_api_key: '', alchemy_api_key: '', max_slippage: 0.02 },
                     flip: { enabled: false, min_conviction: 0.80, min_minutes_left: 9.0 },
                     capital_extractor: { enabled: false, trigger_balance: 2000, withdraw_amount: 1000, withdraw_address: '', auto_resume_after_withdrawal: true, resume_after: 'submitted', default_destination: '' },
-                    telegram: { enabled: false, bot_token: '' }
+                    telegram: { enabled: false, bot_token: '' },
+                    longshot: {
+                        one_at_a_time: true,
+                        one_at_a_time_rule: 'taken',
+                        sniper_enabled: true,
+                        maker_enabled: true,
+                        engine_enabled: true
+                    }
                 },
                 message: '',
                 messageType: '',
@@ -434,7 +499,7 @@
                         // Merge onto the defaults so a section the server omits still has
                         // an object behind it — x-model on an undefined branch throws.
                         for (const k of ['polymarket', 'trading', 'ev', 'live', 'flip',
-                                         'capital_extractor', 'telegram']) {
+                                         'capital_extractor', 'telegram', 'longshot']) {
                             res[k] = Object.assign({}, this.form[k], res[k] || {});
                         }
                         this.form = res;
@@ -510,7 +575,16 @@
                     this.walletError = '';
                     this.copied = '';
                     try {
-                        const data = await (await fetch('/api/test-connection', { method: 'POST' })).json();
+                        const payload = {
+                            private_key: this.form.private_key,
+                            relayer_api_key: this.form.live?.relayer_api_key || '',
+                            alchemy_api_key: this.form.live?.alchemy_api_key || ''
+                        };
+                        const data = await (await fetch('/api/test-connection', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify(payload)
+                        })).json();
                         // The EOA is derived locally from the key, so the server returns it
                         // even when the chain read fails. Keep it — a failed check is exactly
                         // when you want to see which key you are actually using.
@@ -553,7 +627,16 @@
                     this.walletBusy = 'setup';
                     this.flash("Setting up the deposit wallet on-chain… (~30s)", 'success');
                     try {
-                        const data = await (await fetch('/api/setup-wallet', { method: 'POST' })).json();
+                        const payload = {
+                            private_key: this.form.private_key,
+                            relayer_api_key: this.form.live?.relayer_api_key || '',
+                            alchemy_api_key: this.form.live?.alchemy_api_key || ''
+                        };
+                        const data = await (await fetch('/api/setup-wallet', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify(payload)
+                        })).json();
                         if (data.ok) {
                             this.flash(data.skipped ? "Already set up this session."
                                 : ("Wallet ready (" + (data.approvals || 0) + " approvals)."), 'success');
@@ -569,7 +652,16 @@
                 async enableAutoRedeem() {
                     this.walletBusy = 'redeem';
                     try {
-                        const data = await (await fetch('/api/enable-auto-redeem', { method: 'POST' })).json();
+                        const payload = {
+                            private_key: this.form.private_key,
+                            relayer_api_key: this.form.live?.relayer_api_key || '',
+                            alchemy_api_key: this.form.live?.alchemy_api_key || ''
+                        };
+                        const data = await (await fetch('/api/enable-auto-redeem', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify(payload)
+                        })).json();
                         this.flash(data.ok ? "Auto-redeem enabled."
                             : ("Auto-redeem failed: " + (data.error || 'unknown')), data.ok ? 'success' : 'error');
                     } catch (e) {

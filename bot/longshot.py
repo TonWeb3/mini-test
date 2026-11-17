@@ -36,10 +36,12 @@ DEFAULTS: Dict[str, Any] = {
     "sniper_enabled": True,    # PATCH: longshot strategies — the final-minute sniper buys on/off
     "maker_enabled": True,     # PATCH: longshot strategies — the resting maker bids on/off
     "engine_enabled": True,    # PATCH: longshot engine — the GTD engine's own cheap entries as long shots (the paper bot's kind)
+    "one_at_a_time": True,     # only allow one longshot strategy to open per window
+    "one_at_a_time_rule": "taken",
     "engine_max_price": 0.10,  # PATCH: longshot engine — a GTD entry at this ask or less is a long shot
     "engine_min_seconds_left": 2.0,   # PATCH: longshot engine — none with less time left (the paper bot's latest: 2.1 s)
     "engine_cap_cents": 2.0,   # PATCH: longshot engine — the live order: one fill-and-kill at the paper entry + this
-    "engine_stake_pct": 0.0,   # PATCH: longshot engine — % of the balance per engine long shot; 0 = the GTD stake
+    "engine_stake_pct": 1.0,   # PATCH: longshot engine — % of the balance per engine long shot; 0 = the GTD stake
     "engine_own_slot": True,   # PATCH: longshot engine — next to the window's regular trade; False = only with no open position (as TOG)
     "maker": {
         "price": 0.01,         # resting maker bid price (1¢)
@@ -118,6 +120,11 @@ def normalize(user_cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     num(cfg, "max_per_window", "max per window", 0, 100, as_int=True)
     num(cfg, "look_s", "look window", 1, 900)
     cfg["order_type"] = "GTD"
+    rule = str(cfg.get("one_at_a_time_rule") or "taken").strip().lower()   # TOGGLE: one-at-a-time rule
+    if rule in ("taken", "placed"):
+        cfg["one_at_a_time_rule"] = rule
+    else:
+        errs.append('one_at_a_time_rule must be "taken" or "placed"')
     follow = str(cfg.get("follow") or "bet").strip().lower()      # PATCH: longshot follow
     if follow in FOLLOW_MODES:
         cfg["follow"] = follow
@@ -130,7 +137,8 @@ def normalize(user_cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     num(cfg, "engine_cap_cents", "engine long shots live cap (cents)", 0, 99)
     num(cfg, "engine_stake_pct", "engine long shots stake %", 0, 100)
     for key, label in (("sniper_enabled", "sniper"), ("maker_enabled", "maker bids"),
-                       ("engine_enabled", "engine long shots"), ("engine_own_slot", "engine long shots own slot")):   # PATCH: longshot strategies (+ PATCH: longshot engine)
+                       ("engine_enabled", "engine long shots"), ("engine_own_slot", "engine long shots own slot"),
+                       ("one_at_a_time", "one long shot at a time")):   # PATCH: longshot strategies (+ PATCH: longshot engine + exclusive mode)
         v = cfg.get(key, True)
         if isinstance(v, str):
             v = {"true": True, "on": True, "yes": True, "1": True,
@@ -172,8 +180,21 @@ def describe(cfg: Dict[str, Any]) -> str:
         parts = ["sniper off"]
     follow = {"bet": ", follows the GTD bet", "prediction": ", follows the GTD prediction",
               "either": ", follows the GTD bet or prediction"}.get(cfg.get("follow"), ", any side")   # PATCH: longshot follow
-    return (f"stake {stake_text(cfg)}, GTD, max {cfg.get('max_per_window', 1)}/window, last {cfg.get('look_s', 60)}s{follow} | "
+    one_str = " | 1-at-a-time on" if one_at_a_time_on(cfg) else " | 1-at-a-time off"
+    return (f"stake {stake_text(cfg)}, GTD, max {cfg.get('max_per_window', 1)}/window, last {cfg.get('look_s', 60)}s{follow}{one_str} | "
             + ("; ".join(parts) or "no bands") + maker_str + engine_text(cfg))   # PATCH: longshot engine
+
+
+def one_at_a_time_on(cfg: Optional[Dict[str, Any]]) -> bool:
+    """True when exclusive single-longshot mode is enabled: only one longshot strategy can enter per window."""
+    return bool((cfg or {}).get("one_at_a_time", True))
+
+
+def placed_locks(cfg: Optional[Dict[str, Any]]) -> bool:
+    """TOGGLE: one-at-a-time rule. True when "one at a time" is on with the rule "placed": a maker bid that only
+    rests locks the window for the sniper and the engine as well."""
+    c = cfg or {}
+    return one_at_a_time_on(c) and str(c.get("one_at_a_time_rule") or "taken").lower() == "placed"
 
 
 def max_look_s(cfg: Dict[str, Any]) -> float:

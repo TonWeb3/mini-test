@@ -33,6 +33,7 @@ from bot.clob_trader import clob_trader
 import bot.copy_fak as copy_fak            # PATCH: fill-and-kill copy
 import bot.longshot as longshot          # PATCH: longshot
 import bot.ls_maker as ls_maker          # PATCH: longshot maker
+import bot.polybolt as polybolt          # PATCH: price stream
 from types import SimpleNamespace        # PATCH: longshot maker
 
 STATE_PATH = "state_data.json"
@@ -549,6 +550,148 @@ polymarket_ws_stream = ws_data.PolymarketChainlinkStream(
 )
 polymarket_clob_ws = ws_data.PolymarketClobMarketStream(on_update=lambda data=None: _on_book_update())  # PATCH: longshot (ws_data passes the message; the wake doesn't need it)
 chainlink_ws_stream = ws_data.ChainlinkPriceStream(aggregator=settings.get_aggregator(settings.SYMBOL), on_update=_on_chainlink_tick)
+
+# ── PATCH: price stream (config.json "price_stream"; bot/polybolt.py) ─────────────────────────
+# Polymarket's own reference prices over its price socket: the live Chainlink price and the 60-second
+# average (TWAP) the 15-minute markets are decided on. Uses the CLOB API credentials derived from
+# settings.PRIVATE_KEY (hex private key or 12/24-word seed phrase) in BOTH Paper Mode and Live Mode.
+def _ps_creds():
+    """The CLOB API credentials derived from the private key / seed phrase, for the PolyBolt socket login.
+    Works in Paper Mode as well as Live Mode. None without a key."""
+    if not settings.PRIVATE_KEY:
+        return None
+    return clob_trader.get_polybolt_creds()
+
+
+def _ps_on_live(ts: float, price: float) -> None:
+    """Every live Chainlink price of the stream as it arrives. With "prices" on it is treated like a price
+    of the old Polymarket feed: long-shot recorder, entry check, and the loop's next pass at once when the
+    window that just opened has no strike yet."""
+    if _ps_use("prices"):
+        _on_poly_chainlink_tick({"price": price, "updatedAt": ts * 1000.0})
+
+
+def _ps_on_twap(ts: float, price: float) -> None:
+    """When the 60-second TWAP average for the current window's opening arrives, wake update_loop
+    immediately so the Price to Beat (polymarket_twap) is marked right away."""
+    if not _ps_use("prices"):
+        return
+    w_ms = int(settings.CANDLE_WINDOW_MINUTES * 60_000)
+    start_ms = int(time.time() * 1000) // w_ms * w_ms
+    start_s = start_ms / 1000.0
+    if start_s - 1e-6 <= ts <= start_s + _ps_tol():
+        _loop_wake.set()
+        _market_event.set()
+
+
+polybolt_feed = polybolt.PolyBolt(
+    get_creds=_ps_creds,
+    enabled=lambda: polybolt.on(settings.PRICE_STREAM),
+    log=lambda m: log_message(m),
+    symbol=polybolt.symbol_for(settings.SYMBOL),
+    proxy=ws_data.get_proxy_url_for(polybolt.URL) or None,
+    on_live=_ps_on_live,
+    on_twap=_ps_on_twap,
+)
+_ps_noted: set = set()            # window starts whose price-to-beat line is in the log
+_ps_lag_said = [0.0]              # when the "stamped behind this computer's clock" line was last logged
+
+
+def _ps_use(what: str) -> bool:
+    return polybolt.use(settings.PRICE_STREAM, what)
+
+
+def _ps_tol() -> float:
+    return float((settings.PRICE_STREAM or {}).get("pick_tolerance_s") or 2.0)
+
+
+def _ps_live_as_poly_ws(poly_ws: Dict[str, Any]) -> Dict[str, Any]:
+    """update_loop: with "prices" on, Polymarket's live Chainlink price from the price socket, in the shape of
+    the old Polymarket feed's last price — while it is fresh: it arrived, and is stamped, within
+    POLY_WS_MAX_AGE_MS. Otherwise poly_ws as it is (the bot then goes on with its other feeds, as before)."""
+    if not _ps_use("prices"):
+        return poly_ws
+    live = polybolt_feed.live(POLY_WS_MAX_AGE_MS / 1000.0)
+    if not live:
+        return poly_ws
+    behind_ms = (time.time() - live[0]) * 1000.0
+    if behind_ms > POLY_WS_MAX_AGE_MS:
+        if time.time() - _ps_lag_said[0] > 600:
+            _ps_lag_said[0] = time.time()
+            log_message(f"PRICE STREAM: its live price is stamped {behind_ms / 1000.0:.1f}s behind this computer's clock — "
+                        "not used as the bot's price (the bot keeps its own feed)")
+        return poly_ws
+    return {"price": live[1], "updatedAt": live[0] * 1000.0}
+
+
+def _ps_strike(start_ms: int, strike_open: Optional[float], strike_source: str):
+    """update_loop: the window's strike. With "prices" on and Polymarket's 60-second average for the window's
+    start published: that average, which is the price to beat. Else the bot's own, as before."""
+    if not _ps_use("prices"):
+        return strike_open, strike_source
+    ptb = polybolt_feed.twap_at(start_ms / 1000.0, _ps_tol())
+    return (ptb, "polymarket_twap") if ptb is not None else (strike_open, strike_source)
+
+
+def _ps_window_note(start_ms: int, window_ms: int, own_strike: Optional[float]) -> None:
+    """update_loop: one log line per window once Polymarket's average for its start is in: the window's price
+    to beat next to the bot's own strike, and how the window before it closed on these numbers."""
+    if start_ms in _ps_noted or not polybolt.on(settings.PRICE_STREAM):
+        return
+    pt = polybolt_feed.twap_point_at(start_ms / 1000.0, _ps_tol())
+    if pt is None or (own_strike is None and time.time() * 1000 - start_ms < MARK_CAPTURE_WINDOW_MS):
+        return
+    if len(_ps_noted) > 200:
+        _ps_noted.clear()
+    _ps_noted.add(start_ms)
+    avg, late = pt[1], pt[0] - start_ms / 1000.0
+    label = datetime.fromtimestamp(start_ms / 1000).strftime('%H:%M')
+    text = (f"PRICE STREAM: Polymarket's 60-second average at {label}" + (f" (stamped {late:.1f}s after it)" if late >= 0.05 else "")
+            + f" is {avg:,.2f}: the {label} window's price to beat.")
+    if own_strike and abs(own_strike - avg) >= 0.005:
+        gap = own_strike - avg
+        text += f" The bot's own strike: {own_strike:,.2f} (${abs(gap):,.2f} {'higher' if gap >= 0 else 'lower'})."
+    before = polybolt_feed.twap_at((start_ms - window_ms) / 1000.0, _ps_tol())
+    if before is not None:
+        prev = datetime.fromtimestamp((start_ms - window_ms) / 1000).strftime('%H:%M')
+        text += (f" On these numbers the {prev} window closed {'UP' if avg >= before else 'DOWN'}: "
+                 f"${abs(avg - before):,.2f} {'above' if avg >= before else 'below'} its price to beat {before:,.2f}.")
+    log_message(text)
+
+
+def _ps_chance(ctx: Dict[str, Any], now: float, end_ts: float) -> Optional[Dict[str, Any]]:
+    """evaluate_longshot: with "chance" on, the chance on Polymarket's own numbers — that the closing
+    60-second average ends at or above the window's price to beat (longshot.prob_up_twap). None when a number
+    is missing (the price to beat, or a live price that arrived within POLY_WS_MAX_AGE_MS): the chance then
+    stays the one worked out on Binance."""
+    if not _ps_use("chance"):
+        return None
+    ptb = polybolt_feed.twap_at(int(ctx["start_ms"]) / 1000.0, _ps_tol())
+    live = polybolt_feed.live(POLY_WS_MAX_AGE_MS / 1000.0)
+    if ptb is None or live is None:
+        return None
+    vol = longshot.vol_usd_per_sqrt_s(settings.LONGSHOT, live[1], ctx.get("sigma_5m"))
+    r = longshot.prob_up_twap(now, end_ts, ptb, live[1], vol, float(settings.PRICE_STREAM.get("sd_floor_usd") or 0.0),
+                              pts=polybolt_feed.ticks())
+    return {"p_up": r["p_up"], "chance_from": "polymarket_twap", "price_to_beat": round(ptb, 2), "price_now": live[1],
+            "expected_avg": round(r["expected_avg"], 2), "sd": round(r["sd"], 3)}
+
+
+def _ps_settle_call(trade: Dict[str, Any]):
+    """update_trades: (winner, closing average, opening average) on Polymarket's own 60-second averages, with
+    "settle" on and both published; None otherwise (the bot then compares its own two prices, as before)."""
+    start, end = trade.get("window_start_ms"), trade.get("end_ts")
+    if not _ps_use("settle") or not start or not end:
+        return None
+    start, end = float(start) / 1000.0, float(end)
+    dur = end - start
+    if not (240 <= dur <= 360 or 840 <= dur <= 960 or abs(dur - settings.CANDLE_WINDOW_MINUTES * 60) <= 2.0):
+        return None          # not one whole window: left to the bot's own rule
+    opened = polybolt_feed.twap_at(start, _ps_tol())
+    closed = polybolt_feed.twap_at(end, _ps_tol())
+    if opened is None or closed is None:
+        return None
+    return ("UP" if closed >= opened else "DOWN"), closed, opened
 
 def get_candle_window_timing(window_minutes: int) -> Dict[str, float]:
     now_ms = time.time() * 1000
@@ -1069,11 +1212,26 @@ async def _mk_on_fill(bid: "ls_maker.Bid", shares: float, usd: float, via: str) 
     asyncio.create_task(broadcast_state())
 
 
+def _mk_has_other_longshot(start_ms: int) -> bool:
+    """True if another long shot (engine or sniper) is active or entered for this window."""
+    if not longshot.one_at_a_time_on(settings.LONGSHOT):
+        return False
+    sms = int(start_ms)
+    for t in state.get("active_trades", []):
+        if _is_longshot(t) and not _is_ls_maker(t):
+            if t.get("window_start_ms") == sms:
+                return True
+    if sms in _ls_entered_windows:
+        return True
+    return False
+
+
 ls_maker_mgr = ls_maker.MakerManager(SimpleNamespace(
     get_cfg=lambda: settings.LONGSHOT, is_live=_mk_is_live, running=_mk_running,
     place=_mk_place, cancel=_mk_cancel, get_order=_mk_get_order, book=_mk_book,
     trades_since=lambda tok, ts: polymarket_clob_ws.recent_trades(tok, ts) if tok else [],
     balance=_mk_balance, on_fill=_mk_on_fill, log=log_message, persist=_mk_persist,
+    has_other_longshot=_mk_has_other_longshot,
     orphans=lambda: list(state.get("ls_maker_open") or []) if settings.PRIVATE_KEY else []))
 
 
@@ -1496,14 +1654,27 @@ def _le_window_busy(mid: str, slug: str, sms) -> Dict[str, bool]:
     busy = {"regular": any(k in _in_flight_markets for k in keys),
             "longshot": any(("ls:" + k) in _in_flight_markets for k in keys), "engine": False}
     n_ls = 0
+    one_at_a_time = longshot.one_at_a_time_on(settings.LONGSHOT)
     for t in state["active_trades"]:
         if ((mid and str(t.get("market_id")) == mid) or (slug and t.get("market_slug") == slug)
                 or (sms is not None and t.get("window_start_ms") == int(sms))):
             if _is_longshot(t):
-                n_ls += 0 if _is_ls_maker(t) else 1
-                busy["engine"] = busy["engine"] or _is_ls_engine(t)
+                if one_at_a_time:
+                    n_ls += 1
+                    busy["longshot"] = True
+                    busy["engine"] = True
+                else:
+                    n_ls += 0 if _is_ls_maker(t) else 1
+                    busy["engine"] = busy["engine"] or _is_ls_engine(t)
             else:
                 busy["regular"] = True
+    if one_at_a_time and sms is not None:
+        if longshot.placed_locks(settings.LONGSHOT) and ls_maker_mgr.has_active_bid(int(sms)):   # TOGGLE: one-at-a-time rule
+            busy["longshot"] = True
+            busy["engine"] = True
+        if int(sms) in _ls_entered_windows:
+            busy["longshot"] = True
+            busy["engine"] = True
     if n_ls >= int(settings.LONGSHOT.get("max_per_window", 1)):
         busy["longshot"] = True
     return busy
@@ -1813,19 +1984,30 @@ async def execute_trade(decision: Dict[str, Any], market_prices: Dict[str, Any],
                     or (window_start_ms is not None and t.get("window_start_ms") == int(window_start_ms)))
 
         if is_ls:
-            # PATCH: longshot — up to longshot.max_per_window long shots per window;
-            # the regular trade (if any) doesn't count.
-            # (PATCH: longshot maker — maker fills have their own cap, maker.max_fills_per_window)
-            n_ls = sum(1 for t in state["active_trades"] if _is_longshot(t) and not _is_ls_maker(t) and _same_window(t))
-            if n_ls >= int(ls_cfg.get("max_per_window", 1)):
-                if open_reason == "longshot_engine":   # PATCH: longshot engine — once per window in the log
+            if longshot.one_at_a_time_on(ls_cfg):
+                # Exclusive mode: strictly ONE longshot strategy per window
+                has_any_ls = any(_is_longshot(t) and _same_window(t) for t in state["active_trades"])
+                ls_entered = (window_start_ms is not None and int(window_start_ms) in _ls_entered_windows)
+                # TOGGLE: one-at-a-time rule — "placed": a maker bid that rests in this window locks it too
+                maker_rests = (longshot.placed_locks(ls_cfg) and open_reason != "longshot_maker" and window_start_ms is not None
+                               and ls_maker_mgr.has_active_bid(int(window_start_ms)))
+                if has_any_ls or ls_entered or maker_rests:
+                    log_message(f"LONGSHOT skipped: Exclusive mode active and another longshot is already active/placed in this window.")
+                    return "slot_busy"
+            else:
+                # PATCH: longshot — up to longshot.max_per_window long shots per window;
+                # the regular trade (if any) doesn't count.
+                # (PATCH: longshot maker — maker fills have their own cap, maker.max_fills_per_window)
+                n_ls = sum(1 for t in state["active_trades"] if _is_longshot(t) and not _is_ls_maker(t) and _same_window(t))
+                if n_ls >= int(ls_cfg.get("max_per_window", 1)):
+                    if open_reason == "longshot_engine":   # PATCH: longshot engine — once per window in the log
+                        _le_log_skip(market, decision, market_prices, "le_slot_busy")
+                    return "slot_busy"
+                if open_reason == "longshot_engine" and not _le_own_slot() and (   # PATCH: longshot engine — own slot off: only with no open position
+                        any(k in _in_flight_markets for k in _slot_keys(market, "regular"))
+                        or any(not _is_longshot(t) and _same_window(t) for t in state["active_trades"])):
                     _le_log_skip(market, decision, market_prices, "le_slot_busy")
-                return "slot_busy"
-            if open_reason == "longshot_engine" and not _le_own_slot() and (   # PATCH: longshot engine — own slot off: only with no open position
-                    any(k in _in_flight_markets for k in _slot_keys(market, "regular"))
-                    or any(not _is_longshot(t) and _same_window(t) for t in state["active_trades"])):
-                _le_log_skip(market, decision, market_prices, "le_slot_busy")
-                return "slot_busy"
+                    return "slot_busy"
         else:
             # CONSTRAINT: Only one position per market window (do NOT block entering a new window while an old one resolves)
             # PATCH: longshot — long-shot trades don't take the regular slot.
@@ -2010,6 +2192,11 @@ async def execute_trade(decision: Dict[str, Any], market_prices: Dict[str, Any],
                 if is_ls and open_reason == "longshot_engine":   # PATCH: longshot engine — in logs/longshots.csv
                     _le_log("ENTRY", trade, note="paper only")
                 asyncio.create_task(_bg_paper_post_actions())
+
+            if is_ls and window_start_ms is not None and longshot.one_at_a_time_on(ls_cfg):
+                _ls_entered_windows.add(int(window_start_ms))
+                if hasattr(ls_maker_mgr, "cancel_window"):
+                    asyncio.create_task(ls_maker_mgr.cancel_window(int(window_start_ms), "longshot_entered"))
 
             return "entered"
         finally:
@@ -2795,11 +2982,21 @@ async def update_trades(current_prices: Dict[str, Any]):
                 trade["expired_at"] = now_ts
             waited = now_ts - trade["expired_at"]
 
-            if waited < settings.AUTHORITATIVE_SETTLE_WAIT_S:
+            _pt = _ps_settle_call(trade)             # PATCH: price stream — Polymarket's own two averages, when both are there
+            if not _pt and waited < settings.AUTHORITATIVE_SETTLE_WAIT_S:
                 remaining_active.append(trade)
                 continue
 
-            if strike and settlement_price:
+            if _pt:
+                winning_index = up_index if _pt[0] == "UP" else down_index
+                resolution = "close_vs_open"
+                strike, settlement_price = _pt[2], _pt[1]
+                trade["settlement_price_at_expiry"] = trade["close_price"] = settlement_price
+                trade["settle_wait_s"] = round(waited, 1)
+                trade["settle_feed"] = "polymarket_twap"
+                log_message(f"SETTLEMENT for {trade['market_slug']}: "
+                            f"resolved locally on Polymarket's 60-second averages (close {settlement_price:.2f} vs open {strike:.2f} => {_pt[0]})")
+            elif strike and settlement_price:
                 trade["settlement_price_at_expiry"] = settlement_price
                 winning_index = up_index if settlement_price > strike else down_index
                 resolution = "close_vs_open"
@@ -3271,21 +3468,44 @@ async def evaluate_longshot(reason: str = "event"):
 
             p_up = longshot.prob_up_exact(spot, tgt, secs_left, ctx.get("sigma_5m"), ctx.get("drift_5m") or 0.0)
             info: Dict[str, Any] = {"secs_left": round(secs_left, 2), "spot": spot, "model_open": tgt, "strike_open": strike_open}
+            _pv = _ps_chance(ctx, now, end_ts)       # PATCH: price stream — the chance on Polymarket's own numbers, when they are there
+            if _pv:
+                p_up = _pv.pop("p_up")
+                info.update(_pv)
             trade_strike, strike_src = strike_open, strike_src
+
+            one_at_a_time = longshot.one_at_a_time_on(cfg)
+            maker_has_fill = False
+            cur_start = int(ctx["start_ms"])
+            if one_at_a_time:
+                ls_here = [t for t in state["active_trades"]
+                           if _is_longshot(t) and (t.get("window_start_ms") == cur_start or str(t.get("market_id")) == str(ctx.get("market", {}).get("id")))]
+                if any(not _is_ls_maker(t) for t in ls_here) or (cur_start in _ls_entered_windows):
+                    # the sniper or engine has taken the window's long shot
+                    state["ls_last"] = {**status, "result": "one_ls_at_a_time_busy"}
+                    await ls_maker_mgr.cancel_window(cur_start, "one_ls_active")
+                    return
+                maker_has_fill = bool(ls_here)   # the maker's own fill: its bid stays and goes on filling; the sniper stays out
 
             books, raw_ob = _ls_books(ctx)
             allowed, follow_why = _ls_follow_sides(ctx, spot, secs_left)   # PATCH: longshot follow
             if longshot.maker_on(cfg):   # PATCH: longshot maker — the resting bids follow every check
                 _toks = ctx.get("token_ids") or {}
                 await ls_maker_mgr.on_view({
-                    "ts": now, "start_ms": int(ctx["start_ms"]), "end_ts": end_ts, "p_up": p_up,
+                    "ts": now, "start_ms": cur_start, "end_ts": end_ts, "p_up": p_up,
                     "token_ids": {"UP": _toks.get("up"), "DOWN": _toks.get("down")},
                     "sides": allowed, "follow_why": follow_why,          # PATCH: longshot follow
                     "meta": {"market": ctx["market"], "strike": trade_strike, "strike_src": strike_src, "info": dict(info)}})
+            if maker_has_fill:
+                state["ls_last"] = {**status, "result": "one_ls_at_a_time_busy"}
+                return
+            if longshot.placed_locks(cfg) and ls_maker_mgr.has_active_bid(cur_start):   # TOGGLE: one-at-a-time rule
+                state["ls_last"] = {**status, "result": "maker_placed_exclusive"}
+                return
             ceiling = longshot.max_band_ask(cfg)
             if secs_left <= longshot.max_look_s(cfg):
                 for side in ("UP", "DOWN"):
-                    longshot.note_candidate(int(ctx["start_ms"]), side, p_up if side == "UP" else 1.0 - p_up,
+                    longshot.note_candidate(cur_start, side, p_up if side == "UP" else 1.0 - p_up,
                                             books[side]["ask"], secs_left, ceiling)
             decision = longshot.decide(p_up, books, secs_left, cfg, sides=allowed)   # PATCH: longshot follow (sides=)
             state["ls_last"] = {**status, "p_up": round(p_up, 4), "up_ask": books["UP"]["ask"],
@@ -3295,7 +3515,7 @@ async def evaluate_longshot(reason: str = "event"):
             state["ls_last"]["follow"] = follow_why                          # PATCH: longshot follow
             if decision.get("action") != "ENTER":
                 for side in decision.get("skipped") or []:                   # PATCH: longshot follow
-                    _ls_note_skip(int(ctx["start_ms"]), side, books[side]["ask"], follow_why)
+                    _ls_note_skip(cur_start, side, books[side]["ask"], follow_why)
                 return
 
             decision["longshot"] = info
@@ -3305,7 +3525,9 @@ async def evaluate_longshot(reason: str = "event"):
                 open_reason=f"longshot_{decision.get('band')}", kind="longshot")
             state["ls_last"]["exec"] = res
             if res == "entered":
-                _ls_entered_windows.add(int(ctx["start_ms"]))
+                _ls_entered_windows.add(cur_start)
+                if one_at_a_time:
+                    await ls_maker_mgr.cancel_window(cur_start, "sniper_entered")
                 await broadcast_state()
         except Exception as e:
             if now - _ls_last_error_ts > 60:
@@ -3483,6 +3705,10 @@ async def update_loop():
                 log_message(f"Window rollover detected: new window started at {datetime.fromtimestamp(cur_window_start_ms / 1000).strftime('%H:%M:%S')}. Cleared old window context.")
                 state["ls_ctx"] = None              # PATCH: longshot
                 _ls_window_summary(prev_window_start_ms)
+                if hasattr(ls_maker_mgr, "cancel_old_windows"):
+                    asyncio.create_task(ls_maker_mgr.cancel_old_windows(cur_window_start_ms, "next_market_window"))
+                elif hasattr(ls_maker_mgr, "cancel_window"):
+                    asyncio.create_task(ls_maker_mgr.cancel_window(prev_window_start_ms, "next_market_window"))
 
             binance_ws = binance_stream.get_last()
             if not binance_ws.get("price"):
@@ -3490,6 +3716,7 @@ async def update_loop():
                 cl_ws_last = chainlink_ws_stream.get_last()
                 binance_ws["price"] = poly_ws_last.get("price") or cl_ws_last.get("price")
             poly_ws = polymarket_ws_stream.get_last()
+            poly_ws = _ps_live_as_poly_ws(poly_ws)   # PATCH: price stream — Polymarket's live price from the price socket, while "prices" is on and it is fresh
             cl_ws = chainlink_ws_stream.get_last()
 
             spot_cand = binance_ws.get("price") if binance_ws and binance_ws.get("price") else state.get("last_spot_price")
@@ -3575,8 +3802,20 @@ async def update_loop():
             win = mark_window_open(start_ms, window_ms, current_price, spot_price, price_source, price_is_fresh=price_is_fresh,
                                    price_ts_ms=(poly_updated or None) if price_source == "Polymarket WS" else None)
 
-            strike_open = win["chainlink"]
+            own_strike = win["chainlink"]
+            strike_open = own_strike
             strike_source = "chainlink_ws"
+            # PATCH: price stream — the price to beat, once Polymarket has published it; and its line in the log
+            strike_open, strike_source = _ps_strike(start_ms, strike_open, strike_source)
+            if strike_open is not None and win.get("chainlink") is None:
+                win["chainlink"] = strike_open
+                win["genuine"] = True
+            if strike_source == "polymarket_twap" and strike_open is not None:
+                for _t in state.get("active_trades", []):
+                    if _t.get("window_start_ms") == int(start_ms) and _t.get("strike_source") != "polymarket_twap":
+                        _t["strike_price"] = strike_open
+                        _t["strike_source"] = "polymarket_twap"
+            _ps_window_note(start_ms, window_ms, own_strike)
 
             model_open = None
             for c in reversed(klines_5m):
@@ -3899,7 +4138,8 @@ async def update_loop():
                     "model_open": model_open,
                     "window_start_ms": start_ms,
                     "price_is_fresh": price_is_fresh,
-                    "book_source": poly_snapshot.get("book_source") if poly_snapshot.get("ok") else None
+                    "book_source": poly_snapshot.get("book_source") if poly_snapshot.get("ok") else None,
+                    "price_stream": polybolt_feed.view() if polybolt.on(settings.PRICE_STREAM) else None   # PATCH: price stream
                 },
                 "indicators": {
                     "rsi": rsi_now,
@@ -3996,6 +4236,8 @@ async def lifespan(app: FastAPI):
 
     tasks.append(asyncio.create_task(ls_maker_mgr.run_forever()))  # PATCH: longshot maker
     tasks.append(asyncio.create_task(_or_watch_forever()))  # PATCH: official results
+    tasks.append(asyncio.create_task(polybolt_feed.run_forever()))  # PATCH: price stream — it connects only while switched on
+    log_message(polybolt.status_line(settings.PRICE_STREAM))   # PATCH: price stream
     log_message(_or_status_line())   # PATCH: official results
     log_message(longshot.status_line(settings.LONGSHOT))   # PATCH: longshot strategies — on (and what runs) or off
 
@@ -4004,13 +4246,16 @@ async def lifespan(app: FastAPI):
     if settings.PRIVATE_KEY:
         async def _warm_live():
             try:
-                await asyncio.to_thread(clob_trader.ensure_ready)
-                if settings.RELAYER_API_KEY:
-                    try:
-                        setup_res = await asyncio.to_thread(clob_trader.ensure_setup)
-                        log_message(f"Startup on-chain wallet verification: {setup_res}")
-                    except Exception as e:
-                        log_message(f"Startup on-chain wallet verification note: {e}")
+                if (getattr(settings, "MODE", "paper") or "paper").lower() == "live":
+                    await asyncio.to_thread(clob_trader.ensure_ready)
+                    if settings.RELAYER_API_KEY:
+                        try:
+                            setup_res = await asyncio.to_thread(clob_trader.ensure_setup)
+                            log_message(f"Startup on-chain wallet verification: {setup_res}")
+                        except Exception as e:
+                            log_message(f"Startup on-chain wallet verification note: {e}")
+                else:
+                    await asyncio.to_thread(clob_trader.get_polybolt_creds)
             except Exception as e:
                 log_message(f"Live trader pre-warm note: {e}")
         asyncio.create_task(_warm_live())
@@ -4029,6 +4274,7 @@ async def lifespan(app: FastAPI):
     for task in tasks:
         task.cancel()
 
+    polybolt_feed.closed = True
     binance_stream.close()
     binance_kline_1m.close()
     binance_kline_5m.close()
@@ -4361,6 +4607,17 @@ async def post_settings(new_settings: Dict[str, Any]):
 
     new_ls = None
     try:
+        if isinstance(new_settings.get("trading"), dict) and "longshot_risk_value" in new_settings["trading"]:
+            _raw_ls_rv = new_settings["trading"]["longshot_risk_value"]
+            if _raw_ls_rv is not None and _raw_ls_rv != "":
+                _ls_rv = float(_raw_ls_rv)
+                if not (0.0 <= _ls_rv <= 100.0):
+                    raise ValueError("longshot_risk_value must be between 0 and 100")
+                _ls_obj = new_settings.setdefault("longshot", {})
+                if isinstance(_ls_obj, dict):
+                    _ls_obj["sniper_stake_pct"] = _ls_rv
+                    _ls_obj["maker_stake_pct"] = _ls_rv
+                    _ls_obj["engine_stake_pct"] = _ls_rv
         if "longshot" in new_settings:
             if not isinstance(new_settings["longshot"], dict):
                 raise ValueError("longshot must be an object")
@@ -4462,6 +4719,7 @@ async def post_settings(new_settings: Dict[str, Any]):
             pass
 
     merged_cfg.pop("redeem_sweep", None)
+    merged_cfg.pop("price_stream", None)
     if "longshot" in merged_cfg and isinstance(merged_cfg["longshot"], dict):
         for k in ("enabled", "live", "order_type", "max_attempts", "resting_s", "slippage", "cutoff_s",
                   "min_ask_liquidity_usd", "max_price_age_s", "vol_usd_per_sqrt_s", "vol_fallback_usd_per_sqrt_s",
@@ -4596,6 +4854,8 @@ async def post_settings(new_settings: Dict[str, Any]):
             settings.TELEGRAM_BOT_TOKEN = str(tok).strip()
 
     clob_trader.reset()
+    polybolt_feed.set_symbol(polybolt.symbol_for(settings.SYMBOL))   # PATCH: price stream — follows the bot's symbol
+    polybolt_feed.wake()                                             # wake immediately if key or price_stream changed
 
     if settings.SYMBOL != old_symbol:
         binance_stream.close()
@@ -4653,6 +4913,7 @@ async def setup_wallet(body: Optional[Dict[str, Any]] = None):
         from bot.config import normalize_funder_address
         settings.FUNDER_ADDRESS = normalize_funder_address(fa)
     clob_trader.reset()
+    polybolt_feed.wake()
     try:
         result = await asyncio.to_thread(clob_trader.ensure_setup)
         if result.get("ok"):
@@ -4726,6 +4987,7 @@ async def test_connection(body: Optional[Dict[str, Any]] = None):
         print(f"Warning: Failed to persist keys in test_connection: {e}")
 
     clob_trader.reset()
+    polybolt_feed.wake()
     try:
         result = await asyncio.to_thread(clob_trader.test_connection)
         if result.get("ok"):
@@ -4775,6 +5037,7 @@ async def enable_auto_redeem(body: Optional[Dict[str, Any]] = None):
         except Exception:
             pass
     clob_trader.reset()
+    polybolt_feed.wake()
     try:
         result = await asyncio.to_thread(clob_trader.enable_auto_redeem)
         log_message("Auto-redeem enabled" if result.get("ok")

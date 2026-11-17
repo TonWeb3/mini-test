@@ -19,6 +19,8 @@ class Settings(BaseSettings):
     COPY_RESTING_TIMEOUT_S: float = 2.0
     # PATCH: fill-and-kill copy — config.json "copy_fak"; bot/copy_fak.py has the defaults and the checks
     COPY_FAK: Dict = {}
+    # PATCH: price stream — config.json "price_stream"; bot/polybolt.py has the defaults and the checks
+    PRICE_STREAM: Dict = {}
 
     # ── Live trading (Polymarket CLOB V2) ───────────────────────────────────────
     # The wallet is DERIVED from PRIVATE_KEY (hex key or 12/24-word seed phrase) and
@@ -162,11 +164,21 @@ def normalize_order_signer(val: Any) -> Optional[str]:
 
 def load_settings():
     base_settings = Settings()
+    if base_settings.PRIVATE_KEY:
+        try:
+            base_settings.PRIVATE_KEY = normalize_private_key(base_settings.PRIVATE_KEY)
+        except Exception:
+            pass
     try:
         from bot import longshot as _longshot
         base_settings.LONGSHOT = _longshot.merged({})
     except Exception:
         base_settings.LONGSHOT = {}
+    try:                                   # PATCH: price stream — its defaults
+        from bot import polybolt as _polybolt
+        base_settings.PRICE_STREAM = _polybolt.merged({})
+    except Exception:
+        base_settings.PRICE_STREAM = {}
     config_path = CONFIG_PATH if os.path.exists(CONFIG_PATH) else "config.json"
     if os.path.exists(config_path):
         try:
@@ -196,7 +208,7 @@ def load_settings():
                 base_settings.FUNDER_ADDRESS = normalize_funder_address(config_data["funder_address"])
             if "live" in config_data and "funder_address" in config_data["live"]:
                 base_settings.FUNDER_ADDRESS = normalize_funder_address(config_data["live"]["funder_address"])
-            if "private_key" in config_data:
+            if "private_key" in config_data and str(config_data["private_key"]).strip():
                 base_settings.PRIVATE_KEY = normalize_private_key(config_data["private_key"])
 
             if "copy_trader" in config_data:
@@ -287,6 +299,17 @@ def load_settings():
                     base_settings.LONGSHOT = _longshot.normalize(config_data["longshot"])
                 except Exception as e:
                     print(f"Warning: Failed to load longshot config: {e}")
+
+            if "trading" in config_data and isinstance(config_data["trading"], dict):
+                if "longshot_risk_value" in config_data["trading"]:
+                    try:
+                        _ls_rv = float(config_data["trading"]["longshot_risk_value"])
+                        if 0.0 <= _ls_rv <= 100.0:
+                            base_settings.LONGSHOT["sniper_stake_pct"] = _ls_rv
+                            base_settings.LONGSHOT["maker_stake_pct"] = _ls_rv
+                            base_settings.LONGSHOT["engine_stake_pct"] = _ls_rv
+                    except (TypeError, ValueError):
+                        pass
 
             # Legacy flat keys fallback
             if "auto_withdraw_enabled" in config_data and "capital_extractor" not in config_data:

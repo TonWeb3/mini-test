@@ -42,6 +42,11 @@
                         <div :class="data.prices?.book_source === 'ws' ? 'bg-green-500' : (data.prices?.book_source ? 'bg-amber-500' : 'bg-red-500')" class="w-2 h-2 rounded-full mr-1"></div>
                         <span class="text-gray-400">Book WS</span>
                     </div>
+                    <!-- PATCH: price stream — shown while the stream is switched on; green = both numbers are fresh -->
+                    <div class="flex items-center" x-show="data.prices?.price_stream" :title="'Polymarket price stream: ' + (data.prices?.price_stream?.status || '-') + (data.prices?.price_stream?.average != null ? ', 60-second average ' + Number(data.prices.price_stream.average).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2}) : '')">
+                        <div :class="data.prices?.price_stream?.fresh ? 'bg-green-500' : 'bg-amber-500'" class="w-2 h-2 rounded-full mr-1"></div>
+                        <span class="text-gray-400">Price stream</span>
+                    </div>
                 </div>
                 <!-- Start / Stop trading -->
                 <button @click="running ? stopBot() : startBot()" :disabled="botBusy"
@@ -105,7 +110,7 @@
                     x-text="data.prices?.window_open != null ? ('$' + Number(data.prices.window_open).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})) : 'NOT MARKED'"></h2>
                 <p class="text-[10px] mt-1 uppercase tracking-tighter"
                    :class="data.prices?.window_open ? 'text-gray-500' : 'text-red-400'"
-                   x-text="data.prices?.window_open ? ('Chainlink @ eventStartTime') : 'No strike — trading skipped this window'"></p>
+                   x-text="data.prices?.window_open ? ('Chainlink @ eventStartTime' + (data.prices?.window_open_source ? ' (' + data.prices.window_open_source + ')' : '')) : 'No strike — trading skipped this window'"></p>
             </div>
             <div class="bg-gray-800 p-4 sm:p-6 rounded-lg shadow-lg border-l-4 border-purple-500 sm:col-span-2 lg:col-span-1">
                 <p class="text-gray-400 text-xs sm:text-sm uppercase" x-text="'Time Remaining (' + (data.analysis?.decision?.phase || '-') + ')'"></p>
