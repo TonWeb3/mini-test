@@ -148,26 +148,27 @@ _patch_crypto_signing()
 def _ensure_rust_clob():
     """Ensure the native Rust `rust_clob` extension is compiled and imported for the
     current OS/CPU architecture. If not yet installed or if source files were modified,
-    automatically rebuilds `./rust_clob` via pip."""
+    automatically rebuilds `./rust_clob` via pip. Returns the module if available, or None."""
     import os
     import sys
     import shutil
     import subprocess
     import importlib
 
-    proj_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    crate_dir = os.path.join(proj_root, "rust_clob")
-    src_file = os.path.join(crate_dir, "src", "lib.rs")
-    cargo_file = os.path.join(crate_dir, "Cargo.toml")
-
     try:
         import rust_clob
-        return rust_clob
+        if getattr(rust_clob, "__file__", None) is not None and hasattr(rust_clob, "init_client"):
+            return rust_clob
+        # If it was imported as an empty namespace package from the local directory, purge it
+        if "rust_clob" in sys.modules and getattr(sys.modules["rust_clob"], "__file__", None) is None:
+            del sys.modules["rust_clob"]
     except ImportError:
         pass
 
+    proj_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    crate_dir = os.path.join(proj_root, "rust_clob")
     if not os.path.isdir(crate_dir):
-        raise RuntimeError(f"Missing rust_clob crate directory at {crate_dir}")
+        return None
 
     env = os.environ.copy()
     cargo_bin = os.path.expanduser("~/.cargo/bin")
@@ -176,28 +177,39 @@ def _ensure_rust_clob():
 
     if not shutil.which("cargo", path=env.get("PATH")):
         if os.name != "nt":
-            print("[rust_clob] Rust toolchain not found — installing rustup automatically...")
-            subprocess.run(
-                "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal",
-                shell=True,
-                check=True,
-                env=env,
-            )
-            env["PATH"] = f"{cargo_bin}{os.pathsep}{env.get('PATH', '')}"
+            try:
+                print("[rust_clob] Rust toolchain not found — installing rustup automatically...")
+                subprocess.run(
+                    "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal",
+                    shell=True,
+                    check=True,
+                    env=env,
+                )
+                env["PATH"] = f"{cargo_bin}{os.pathsep}{env.get('PATH', '')}"
+            except Exception:
+                return None
         else:
-            raise RuntimeError("Rust toolchain (cargo) not found in PATH.")
+            return None
 
-    print(f"[rust_clob] Compiling/reinstalling native Rust extension from {crate_dir} ...")
-    subprocess.run(
-        [sys.executable, "-m", "pip", "install", "--no-deps", "--force-reinstall", crate_dir],
-        check=True,
-        env=env,
-    )
-    if "rust_clob" in sys.modules:
-        import rust_clob
-        return importlib.reload(rust_clob)
-    import rust_clob
-    return rust_clob
+    try:
+        print(f"[rust_clob] Compiling/reinstalling native Rust extension from {crate_dir} ...")
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--no-deps", "--force-reinstall", crate_dir],
+            check=True,
+            capture_output=True,
+            env=env,
+        )
+        if "rust_clob" in sys.modules:
+            import rust_clob
+            mod = importlib.reload(rust_clob)
+        else:
+            import rust_clob
+            mod = rust_clob
+        if hasattr(mod, "init_client"):
+            return mod
+    except Exception as e:
+        print(f"[rust_clob] Native build not available ({e}); using Python fallback.")
+    return None
 
 
 DEPOSIT_WALLET_FACTORY = "0x00000000000Fb5C9ADea0298D729A0CB3823Cc07"
@@ -568,40 +580,44 @@ class ClobTrader:
             pass
 
         # Initialize native Rust order signer & persistent HTTP/1.1 Keep-Alive sender
-        rust_mod = _ensure_rust_clob()
-        pk_hex = clob.signer.account.key.hex() if hasattr(clob.signer, "account") else clob.signer.private_key
-        creds = clob.creds
-        eoa = self.get_eoa_address() or ""
+        rust_mod = self._rust_mod_or_none()
         mode = self._start_signer_mode(sig_type, funder)
-        signer = funder if (sig_type == 3 and mode == "wallet") else eoa
-        base_args = (
-            str(pk_hex),
-            str(funder),
-            int(sig_type),
-            str(creds.key),
-            str(creds.secret),
-            str(creds.passphrase),
-            str(clob.base_url),
-            137,
-        )
-        try:
-            rust_mod.init_client(*base_args, signer_address=str(signer))
-            self._rust_can_switch = hasattr(rust_mod, "set_signer")
-        except TypeError:
-            # rust_clob still built from the previous lib.rs: no signer choice there,
-            # it always puts the deposit wallet in order.signer for type 3.
-            rust_mod.init_client(*base_args)
+        eoa = self.get_eoa_address() or ""
+        creds = clob.creds
+        if rust_mod and hasattr(rust_mod, "init_client"):
+            pk_hex = clob.signer.account.key.hex() if hasattr(clob.signer, "account") else clob.signer.private_key
+            signer = funder if (sig_type == 3 and mode == "wallet") else eoa
+            base_args = (
+                str(pk_hex),
+                str(funder),
+                int(sig_type),
+                str(creds.key),
+                str(creds.secret),
+                str(creds.passphrase),
+                str(clob.base_url),
+                137,
+            )
+            try:
+                rust_mod.init_client(*base_args, signer_address=str(signer))
+                self._rust_can_switch = hasattr(rust_mod, "set_signer")
+            except TypeError:
+                rust_mod.init_client(*base_args)
+                self._rust_can_switch = False
+                mode = "wallet" if sig_type == 3 else "eoa"
+                self._log("WARNING: rust_clob was not rebuilt from the new lib.rs, so the order signer "
+                          "can't be switched. Rebuild it: pip install --no-deps --force-reinstall ./rust_clob")
+            self._signer_mode = mode
+            self._rust_ready = True
+            if not all(hasattr(rust_mod, n) for n in ("post_order_async", "warm_connection")):
+                self._log("WARNING: rust_clob is an older build without the fast order sender: "
+                          "orders wait for a Python thread. If rust_clob was just "
+                          "rebuilt, restart the bot to load the new build; otherwise rebuild it: "
+                          "pip install --no-deps --force-reinstall ./rust_clob")
+        else:
+            self._rust_ready = False
             self._rust_can_switch = False
-            mode = "wallet" if sig_type == 3 else "eoa"
-            self._log("WARNING: rust_clob was not rebuilt from the new lib.rs, so the order signer "
-                      "can't be switched. Rebuild it: pip install --no-deps --force-reinstall ./rust_clob")
-        self._signer_mode = mode
-        self._rust_ready = True
-        if not all(hasattr(rust_mod, n) for n in ("post_order_async", "warm_connection")):
-            self._log("WARNING: rust_clob is an older build without the fast order sender: "
-                      "orders wait for a Python thread. If rust_clob was just "
-                      "rebuilt, restart the bot to load the new build; otherwise rebuild it: "
-                      "pip install --no-deps --force-reinstall ./rust_clob")
+            self._signer_mode = mode
+            self._log("NOTE: native rust_clob signer not available; orders will execute via Python CLOB client.")
 
         self.gasless = gasless
         self.clob = clob
@@ -764,18 +780,43 @@ class ClobTrader:
         post_only: bool = False,
     ) -> Dict[str, Any]:
         """Sign EIP-712 / Solady ERC-1271 order and POST via native Rust (`rust_clob`),
-        releasing the GIL during network I/O."""
-        rust_mod = _ensure_rust_clob()
-        post_args = self._post_args(token_id, maker_amount, taker_amount, side_int, order_type_str, expiration_str, neg_risk,
-                                    post_only)
-        try:
-            res = rust_mod.post_order(*post_args)
-        except TypeError:
+        releasing the GIL during network I/O, with automatic Python CLOB fallback."""
+        rust_mod = self._rust_mod_or_none()
+        if rust_mod is not None and hasattr(rust_mod, "post_order") and self._rust_ready:
+            post_args = self._post_args(token_id, maker_amount, taker_amount, side_int, order_type_str, expiration_str, neg_risk,
+                                        post_only)
             try:
-                res = rust_mod.post_order(*post_args[:-1])
+                res = rust_mod.post_order(*post_args)
             except TypeError:
-                res = rust_mod.post_order(*post_args[:-2])
-        return self._finish_post(res, post_args, rust_mod)
+                try:
+                    res = rust_mod.post_order(*post_args[:-1])
+                except TypeError:
+                    res = rust_mod.post_order(*post_args[:-2])
+            return self._finish_post(res, post_args, rust_mod)
+
+        # Fallback to pure Python PolymarketClobClient
+        from polymarket_apis.types.clob_types import OrderArgs, OrderType
+        side_str = "BUY" if side_int == 0 else "SELL"
+        price_val = round(float(maker_amount) / float(taker_amount), 4) if (side_int == 1 and taker_amount > 0) else round(float(taker_amount) / float(maker_amount), 4)
+        size_val = round(float(taker_amount if side_int == 0 else maker_amount) / 1e6, 2)
+        order_args = OrderArgs(
+            price=price_val,
+            size=size_val,
+            side=side_str,
+            token_id=str(token_id),
+        )
+        signed_order = self.clob.create_order(order_args)
+        clob_otype = OrderType(order_type_str) if order_type_str in ("GTC", "GTD", "FOK", "FAK") else OrderType.GTD
+        resp = self.clob.post_order(signed_order, order_type=clob_otype, post_only=post_only)
+        if hasattr(resp, "model_dump"):
+            return resp.model_dump()
+        elif isinstance(resp, dict):
+            return resp
+        return {
+            "order_id": getattr(resp, "order_id", None) or getattr(resp, "orderID", None) or str(resp),
+            "status": getattr(resp, "status", "open"),
+            "success": getattr(resp, "success", True)
+        }
 
     @staticmethod
     def _post_args(token_id, maker_amount, taker_amount, side_int, order_type_str, expiration_str="0", neg_risk=False,
@@ -922,7 +963,10 @@ class ClobTrader:
 
     def _rust_mod_or_none(self):
         try:
-            return _ensure_rust_clob()
+            m = _ensure_rust_clob()
+            if m is not None and getattr(m, "__file__", None) is not None and hasattr(m, "init_client"):
+                return m
+            return None
         except Exception:
             return None
 

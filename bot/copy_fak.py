@@ -34,6 +34,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 # ── Settings ─────────────────────────────────────────────────────────────────────────────
 DEFAULTS: Dict[str, Any] = {
     "enabled": True,           # the live copy is one fill-and-kill order (enabled by default)
+    "order_type": "FOK",       # "FOK" (Fill-Or-Kill / all-or-none) or "FAK" (Fill-And-Kill / partial fills allowed)
     "cap_cents": 0.0,          # pay at most the paper entry + this many cents (+0¢ base cap)
     "high_cap_cents": 5.0,     # ... or + this many when the paper entry is above high_from_price (+5¢ high cap)
     "high_from_price": 0.55,   # paper entries above this price use high_cap_cents (55¢ threshold)
@@ -85,6 +86,9 @@ def merged(cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     out = dict(DEFAULTS)
     if not isinstance(cfg, dict):
         return out
+    ot = str(cfg.get("order_type") or "FOK").strip().upper()
+    if ot in ("FAK", "FOK"):
+        out["order_type"] = ot
     for k in BOOLS:
         if k in cfg:
             try:
@@ -107,6 +111,12 @@ def normalize(new: Any, current: Optional[Dict[str, Any]] = None) -> Dict[str, A
     if not isinstance(new, dict):
         raise ValueError("copy_fak must be an object")
     out = merged(current)
+    if "order_type" in new and new["order_type"] is not None:
+        ot = str(new["order_type"]).strip().upper()
+        if ot in ("FAK", "FOK"):
+            out["order_type"] = ot
+        else:
+            raise ValueError("order_type must be FAK or FOK")
     for k in BOOLS:
         if k in new and new[k] is not None and new[k] != "":
             out[k] = as_bool(new[k], f"copy_fak.{k}")
@@ -269,8 +279,8 @@ def read_answer(data: Dict[str, Any], maker_amt: int, taker_amt: int) -> Dict[st
     }
 
 
-def place(trader: Any, settings: Any, token_id: str, usd: float, price: float) -> Dict[str, Any]:
-    """Send the fill-and-kill BUY and wait for Polymarket's answer (blocking: run it on a thread)."""
+def place(trader: Any, settings: Any, token_id: str, usd: float, price: float, order_type: str = "FOK") -> Dict[str, Any]:
+    """Send the marketable BUY (FOK or FAK) and wait for Polymarket's answer (blocking: run it on a thread)."""
     if not token_id:
         return {"ok": False, "error": "missing_token_id"}
     if not trader.ensure_ready():
@@ -281,9 +291,10 @@ def place(trader: Any, settings: Any, token_id: str, usd: float, price: float) -
         except Exception:
             pass
     try:
+        ot = "FOK" if str(order_type).upper() == "FOK" else "FAK"
         side_int, maker_amt, taker_amt = order_amounts(trader, token_id, usd, price)
         data = trader._post_order_fast(token_id=str(token_id), maker_amount=maker_amt, taker_amount=taker_amt,
-                                       side_int=side_int, order_type_str="FAK", expiration_str="0", neg_risk=False)
+                                       side_int=side_int, order_type_str=ot, expiration_str="0", neg_risk=False)
         return read_answer(data, maker_amt, taker_amt)
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
@@ -294,10 +305,11 @@ def _thread_runner(trader: Any) -> Callable:
     return getattr(trader, "run_io", None) or (lambda fn, *a: asyncio.to_thread(fn, *a))
 
 
-async def place_async(trader: Any, settings: Any, token_id: str, usd: float, price: float) -> Dict[str, Any]:
+async def place_async(trader: Any, settings: Any, token_id: str, usd: float, price: float, order_type: str = "FOK") -> Dict[str, Any]:
     """place() from the event loop. When the bot's order library can send from its own threads
     (rust_clob's post_order_async) the order is signed right here and leaves at once; otherwise
     place() runs on a thread. Same result dict."""
+    ot = "FOK" if str(order_type).upper() == "FOK" else "FAK"
     run = _thread_runner(trader)
     mod = sys.modules.get("rust_clob")
     ready = bool(getattr(trader, "ready", False) and getattr(trader, "_rust_ready", False)
@@ -312,11 +324,11 @@ async def place_async(trader: Any, settings: Any, token_id: str, usd: float, pri
         else:
             fast = False                       # place() runs that setup first, as the bot's own orders do
     if not fast:
-        return await run(place, trader, settings, token_id, usd, price)
+        return await run(place, trader, settings, token_id, usd, price, ot)
     try:
         side_int, maker_amt, taker_amt = order_amounts(trader, token_id, usd, price)
         if two_step:
-            post_args = trader._post_args(token_id, maker_amt, taker_amt, side_int, "FAK", "0", False, False)
+            post_args = trader._post_args(token_id, maker_amt, taker_amt, side_int, ot, "0", False, False)
             try:
                 ticket = mod.post_order_async(*post_args)
             except TypeError:
@@ -326,7 +338,7 @@ async def place_async(trader: Any, settings: Any, token_id: str, usd: float, pri
                     ticket = mod.post_order_async(*post_args[:-2])
         else:
             ticket = mod.post_order_async(str(token_id), int(maker_amt), int(taker_amt), int(side_int),
-                                          "FAK", "0", False, False, False)
+                                          ot, "0", False, False, False)
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
     try:
@@ -430,7 +442,8 @@ async def live_copy(trade: Dict[str, Any], evaluated_price: Optional[float] = No
                 trade["live_quoted_price"] = paper
                 trade["live_order_usd"] = usd
                 t_send = time.perf_counter()
-                res = await place_async(trader, settings, token_id, usd, limit)
+                otype = str(cfg.get("order_type") or "FOK").strip().upper()
+                res = await place_async(trader, settings, token_id, usd, limit, order_type=otype)
                 t_answer = time.perf_counter()
                 send_ms = (t_answer - t_send) * 1000.0
                 trade["live_answer_ms"] = round((t_answer - t_start) * 1000.0, 1)

@@ -50,6 +50,7 @@
     "max_per_window": 1,
     "look_s": 60.0,
     "follow": "either",
+    "order_type": "FOK",
     "sniper_stake_pct": 1.0,
     "maker_stake_pct": 1.0,
     "engine_max_price": 0.1,
@@ -67,13 +68,6 @@
         "max_price": 0.04
       }
     }
-  },
-  "longshot": {
-    "one_at_a_time": true,
-    "one_at_a_time_rule": "taken",
-    "sniper_enabled": true,
-    "maker_enabled": true,
-    "engine_enabled": true
   },
   "ev": {
     "ev_threshold": 0.04,

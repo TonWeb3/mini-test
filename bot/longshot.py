@@ -31,6 +31,9 @@ DEFAULTS: Dict[str, Any] = {
     "look_s": 60,              # final minute look window in seconds
     "cutoff_s": 3.0,           # no new long shots in the last N seconds
     "follow": "either",        # PATCH: longshot follow — "bet", "prediction", "either" or "off" (see FOLLOW_MODES)
+    "order_type": "FOK",       # order type: FOK / FAK / GTD / GTC
+    "sniper_order_type": "",   # sniper: FOK / FAK
+    "maker_order_type": "",    # maker: GTD
     "sniper_stake_pct": 1.0,   # PATCH: longshot stake — % of the balance per sniper buy; 0 = the GTD stake
     "maker_stake_pct": 1.0,    # PATCH: longshot stake — % of the balance per maker bid; 0 = the GTD stake
     "sniper_enabled": True,    # PATCH: longshot strategies — the final-minute sniper buys on/off
@@ -59,7 +62,7 @@ BAND_TEMPLATE = {"ask_min": 0.01, "ask_max": 0.03, "max_price": 0.04}
 
 MAKER_DEFAULTS = DEFAULTS["maker"]
 
-ORDER_TYPES = ("GTD",)
+ORDER_TYPES = ("FAK", "FOK", "GTD", "GTC")
 
 # PATCH: longshot follow — which side a long shot (sniper buy or maker bid) may take:
 #   "bet"        the side of the window's first regular GTD trade; no long shot without one
@@ -119,7 +122,17 @@ def normalize(user_cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 
     num(cfg, "max_per_window", "max per window", 0, 100, as_int=True)
     num(cfg, "look_s", "look window", 1, 900)
-    cfg["order_type"] = "GTD"
+    ot = str(cfg.get("order_type") or "FOK").strip().upper()
+    if ot in ORDER_TYPES:
+        cfg["order_type"] = ot
+    else:
+        errs.append('order_type must be "FAK", "FOK", "GTD" or "GTC"')
+    for kind, allowed in (("sniper", ORDER_TYPES), ("maker", ("GTD", "GTC")), ("engine", ORDER_TYPES)):
+        own = str(cfg.get(kind + "_order_type") or "").strip().upper()
+        if own == "" or own in allowed:
+            cfg[kind + "_order_type"] = own
+        else:
+            errs.append(f'{kind}_order_type must be empty or one of ' + ", ".join(allowed))
     rule = str(cfg.get("one_at_a_time_rule") or "taken").strip().lower()   # TOGGLE: one-at-a-time rule
     if rule in ("taken", "placed"):
         cfg["one_at_a_time_rule"] = rule
@@ -183,6 +196,16 @@ def describe(cfg: Dict[str, Any]) -> str:
     one_str = " | 1-at-a-time on" if one_at_a_time_on(cfg) else " | 1-at-a-time off"
     return (f"stake {stake_text(cfg)}, GTD, max {cfg.get('max_per_window', 1)}/window, last {cfg.get('look_s', 60)}s{follow}{one_str} | "
             + ("; ".join(parts) or "no bands") + maker_str + engine_text(cfg))   # PATCH: longshot engine
+
+
+def order_type_for(cfg: Optional[Dict[str, Any]], kind: str) -> str:
+    """The order type of one kind of long shot ("sniper", "maker", "engine"): its own
+    setting, or the general one when its own is empty. A maker bid has to rest: GTC when that says GTC, else GTD."""
+    c = cfg or {}
+    ot = str(c.get(kind + "_order_type") or c.get("order_type") or "FOK").strip().upper()
+    if kind == "maker":
+        return "GTC" if ot == "GTC" else "GTD"
+    return ot if ot in ORDER_TYPES else "FOK"
 
 
 def one_at_a_time_on(cfg: Optional[Dict[str, Any]]) -> bool:

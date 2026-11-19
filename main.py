@@ -1385,7 +1385,7 @@ async def _continuous_live_copy_fill(trade: Dict[str, Any], market: Dict[str, An
             if cur_ask_liq_usd is not None and cur_ask_liq_usd >= min_order_cost and live_amount > cur_ask_liq_usd:
                 live_amount = round(cur_ask_liq_usd, 2)
 
-            # Place GTD limit BUY order directly with progressive sweep
+            # Place limit BUY order directly with progressive sweep
             extra_slip = min(0.08, (attempt_num - 1) * 0.015)
             limit_cap = float((trade.get("longshot") or {}).get("max_price") or 0.99) if is_ls else 0.99
             gtd_price = min(limit_cap, round(current_ask + settings.CLOB_MAX_SLIPPAGE + extra_slip, 4))
@@ -1395,10 +1395,20 @@ async def _continuous_live_copy_fill(trade: Dict[str, Any], market: Dict[str, An
             gtd_shares = max(min_shares, math.ceil((safe_usd / gtd_price) * 100.0) / 100.0)
             while round(gtd_shares * gtd_price, 4) < 1.00:
                 gtd_shares = round(gtd_shares + 0.01, 2)
-            gtd_tick, order_type = ("0.001" if gtd_price < 0.04 else "0.01"), "GTD"
+            gtd_tick = "0.001" if gtd_price < 0.04 else "0.01"
+            if is_ls:
+                order_type = longshot.order_type_for(ls_cfg, "engine" if _is_ls_engine(trade) else "sniper")
+            else:
+                order_type = str((getattr(settings, "COPY_FAK", None) or {}).get("order_type") or "FOK").strip().upper()
+            if order_type not in ("FAK", "FOK", "GTD", "GTC"):
+                order_type = "FOK"
+
+            if order_type in ("FAK", "FOK"):
+                # a FAK / FOK buy's dollar amount may have 2 decimals at most: whole shares that cost whole cents
+                gtd_shares = longshot.order_shares(safe_usd, gtd_price, max_usd=live_balance)
 
             market_end = trade.get("end_ts") or 0
-            expiration = int(max(time.time() + 300, market_end))
+            expiration = int(max(time.time() + 300, market_end)) if order_type == "GTD" else 0
 
             _t_send = time.perf_counter()
             gtd_res = await clob_trader.place_limit_buy_async(token_id, gtd_shares, gtd_price, expiration, gtd_tick, order_type)
@@ -1406,44 +1416,26 @@ async def _continuous_live_copy_fill(trade: Dict[str, Any], market: Dict[str, An
             if order_sent is not None:
                 order_sent.set()
             if attempt_num == 1:
-                log_message(f"LIVE copy started for {trade['market_slug']} ({side}{', long shot' if is_ls else ''}) — continuous GTD fill loop initiated")
+                log_message(f"LIVE copy started for {trade['market_slug']} ({side}{', long shot' if is_ls else ''}) — continuous {order_type} fill loop initiated")
             # (same start as before, so anything that reads these lines still matches; now written
             # once the order is out, with how long Polymarket took to answer)
-            log_message(f"LIVE copy attempt #{attempt_num} for {side}{' long shot' if is_ls else ''}: placing GTD limit order for {gtd_shares:.2f} shares @ {gtd_price:.4f} "
-                        + f"(exp: {expiration})... sent, Polymarket answered in {_send_ms:.0f} ms")
+            exp_str = f" (exp: {expiration})" if order_type == "GTD" else ""
+            log_message(f"LIVE copy attempt #{attempt_num} for {side}{' long shot' if is_ls else ''}: placing {order_type} limit order for {gtd_shares:.2f} shares @ {gtd_price:.4f}{exp_str}... sent, Polymarket answered in {_send_ms:.0f} ms")
 
             if gtd_res.get("ok") and gtd_res.get("order_id"):
                 order_id = gtd_res["order_id"]
                 order_placed_ts = time.time()
-                trade["live_status"] = "GTD_OPEN"
                 trade["live_order_id"] = order_id
                 trade["live_limit_price"] = gtd_price
                 trade["live_quoted_price"] = current_ask
                 trade["live_expiration"] = expiration
-                save_state()
-                _sync_active_trades_to_latest_data()
-                await broadcast_state()
-                log_message(f"LIVE GTD limit order placed for {side}: {gtd_shares:.2f} shares @ {gtd_price:.4f} (order {order_id}) — resting on book")
 
-                # Monitor GTD order until filled, window expires (<15s), or 4s re-quote timeout
-                while trade["status"] == "OPEN" and trade.get("live_status") == "GTD_OPEN":
-                    now_ts = time.time()
-                    if trade.get("end_ts") and now_ts >= trade["end_ts"]:
-                        log_message(f"Cancelling resting GTD order {order_id}: window expired")
-                        filled = await handle_order_gone_quiet(order_id, trade, token_id, current_ask, gtd_price, "GTD")
-                        if not filled:
-                            trade["live_status"] = "TIMEOUT"
-                            save_state()
-                            _sync_active_trades_to_latest_data()
-                            await broadcast_state()
-                        return
-
-                    # Check status on CLOB
+                if order_type in ("FAK", "FOK"):
+                    trade["live_status"] = f"{order_type}_SENT"
                     ord_status = await asyncio.to_thread(clob_trader.check_order_status, order_id)
-                    st = ord_status.get("status")
+                    st = str(ord_status.get("status") or gtd_res.get("status") or "").upper()
 
-                    if st == "FILLED":
-                        # Never assume fills or prices: verify exact trade fills directly from CLOB API!
+                    if st in ("FILLED", "MATCHED"):
                         fills = await asyncio.to_thread(clob_trader.get_order_fills, order_id, token_id)
                         if fills:
                             total_shares = sum(float(f["size"]) for f in fills)
@@ -1478,66 +1470,142 @@ async def _continuous_live_copy_fill(trade: Dict[str, Any], market: Dict[str, An
                         _sync_active_trades_to_latest_data()
                         await broadcast_state()
 
-                        msg = (f"LIVE trade FILLED via GTD limit (attempt #{attempt_num}): {side} ${fill_usd:.2f} on {trade['market_slug']} "
+                        msg = (f"LIVE trade FILLED via {order_type} limit (attempt #{attempt_num}): {side} ${fill_usd:.2f} on {trade['market_slug']} "
                                f"— {fill_size:.2f} shares @ {fill_price:.4f} (paper entry {trade['paper_entry_price']:.4f}, order {order_id})")
                         log_message(msg)
-                        await send_telegram(f"🚀 *LIVE Copy FILLED (GTD Limit)*\n• Side: `{side}`\n• Fill Price: `{fill_price:.4f}`\n• Shares: `{fill_size:.2f}`\n• Amount: `${fill_usd:.2f}`\n• Market: `{trade['market_slug']}`")
+                        await send_telegram(f"🚀 *LIVE Copy FILLED ({order_type} Limit)*\n• Side: `{side}`\n• Fill Price: `{fill_price:.4f}`\n• Shares: `{fill_size:.2f}`\n• Amount: `${fill_usd:.2f}`\n• Market: `{trade['market_slug']}`")
                         return
-
-                    # Check if partial fill happened while resting on book
-                    matched = ord_status.get("size_matched", 0.0)
-                    if matched > 0 and matched != trade.get("live_shares"):
-                        trade["live_shares"] = matched
-                        trade["live_entry_price"] = float(ord_status.get("price") or gtd_price)
-                        save_state()
-                        _sync_active_trades_to_latest_data()
-                        await broadcast_state()
-
-                    # Explicit cancellation confirmed from exchange
-                    if st == "CANCELLED":
-                        await handle_order_gone_quiet(order_id, trade, token_id, current_ask, gtd_price, "GTD")
-                        return
-
-                    # Check if market ask has surged above our resting limit price
-                    # If market jumped away, cancel early to re-quote at the higher price instead of waiting 4s passively
-                    if now_ts - order_placed_ts >= 1.5:
-                        ws_sum = polymarket_clob_ws.get_summary(token_id, max_age_s=5.0)
-                        ws_ask = ws_sum.get("bestAsk") if ws_sum else None
-                        if ws_ask and ws_ask > gtd_price:
-                            log_message(f"Market ask surged ({ws_ask:.4f} > limit {gtd_price:.4f}) — cancelling resting GTD early to re-quote at fresh ask...")
-                            filled = await handle_order_gone_quiet(order_id, trade, token_id, current_ask, gtd_price, "GTD")
-                            if filled:
-                                return
-                            if attempt_num < max_attempts:
-                                trade["live_status"] = "FILLING"
-                                break
-
-                    # 4-Second Resting Lifetime (long shots: settings longshot.resting_s):
-                    # Enforce the full resting window. Once reached, cancel and verify all partial fills!
-                    if now_ts - order_placed_ts >= resting_s:
-                        log_message(f"Resting GTD order {order_id} reached {resting_s:g}s timeout — verifying fills and cancelling on exchange...")
-                        filled = await handle_order_gone_quiet(order_id, trade, token_id, current_ask, gtd_price, "GTD")
-                        if filled:
-                            return
-
+                    else:
                         if attempt_num < max_attempts:
-                            log_message(f"Resting GTD order {order_id} cancelled on exchange — re-quoting at freshest ask (attempt #{attempt_num + 1})...")
+                            log_message(f"LIVE {order_type} attempt #{attempt_num} for {side} not filled ({st or 'no match'}) — re-quoting at freshest ask (attempt #{attempt_num + 1})...")
                             trade["live_status"] = "FILLING"
-                            break
                         else:
-                            log_message(f"GTD order {order_id} cancelled on exchange after max attempts ({max_attempts}) — stopping order placement for this window to prevent duplicate entry.")
-                            trade["live_status"] = "CANCELLED"
+                            log_message(f"LIVE {order_type} order for {side} not filled after max attempts ({max_attempts}) — stopping order placement for this window.")
+                            trade["live_status"] = "MISSED"
                             save_state()
                             _sync_active_trades_to_latest_data()
                             await broadcast_state()
                             return
+                else:
+                    trade["live_status"] = "GTD_OPEN"
+                    save_state()
+                    _sync_active_trades_to_latest_data()
+                    await broadcast_state()
+                    log_message(f"LIVE GTD limit order placed for {side}: {gtd_shares:.2f} shares @ {gtd_price:.4f} (order {order_id}) — resting on book")
 
-                    await asyncio.sleep(0.5)
+                    # Monitor GTD order until filled, window expires (<15s), or 4s re-quote timeout
+                    while trade["status"] == "OPEN" and trade.get("live_status") == "GTD_OPEN":
+                        now_ts = time.time()
+                        if trade.get("end_ts") and now_ts >= trade["end_ts"]:
+                            log_message(f"Cancelling resting GTD order {order_id}: window expired")
+                            filled = await handle_order_gone_quiet(order_id, trade, token_id, current_ask, gtd_price, "GTD")
+                            if not filled:
+                                trade["live_status"] = "TIMEOUT"
+                                save_state()
+                                _sync_active_trades_to_latest_data()
+                                await broadcast_state()
+                            return
+
+                        # Check status on CLOB
+                        ord_status = await asyncio.to_thread(clob_trader.check_order_status, order_id)
+                        st = ord_status.get("status")
+
+                        if st == "FILLED":
+                            # Never assume fills or prices: verify exact trade fills directly from CLOB API!
+                            fills = await asyncio.to_thread(clob_trader.get_order_fills, order_id, token_id)
+                            if fills:
+                                total_shares = sum(float(f["size"]) for f in fills)
+                                total_usd = sum(float(f["size"]) * float(f["price"]) for f in fills)
+                                fill_size = total_shares
+                                fill_price = total_usd / total_shares if total_shares > 0 else float(ord_status.get("price") or gtd_price)
+                                fill_usd = total_usd
+                            else:
+                                fill_size = float(ord_status.get("size_matched") or gtd_shares)
+                                fill_price = float(ord_status.get("price") or gtd_price)
+                                fill_usd = fill_size * fill_price
+
+                            trade["live_status"] = "FILLED"
+                            trade["live_entry_price"] = fill_price
+                            trade["live_shares"] = fill_size
+                            trade["live_amount"] = fill_usd
+                            trade["live_entry_time"] = datetime.now().isoformat()
+                            trade["live_slippage"] = fill_price - current_ask
+
+                            # Immediately deduct spent funds in RAM
+                            if fill_usd > 0:
+                                new_bal = max(0.0, (state.get("live_balance") or 0.0) - fill_usd)
+                                state["live_balance"] = new_bal
+                                risk_type = (settings.RISK_TYPE or "percent").lower()
+                                if risk_type == "fixed":
+                                    new_stake = float(settings.RISK_VALUE)
+                                else:
+                                    new_stake = (float(settings.RISK_VALUE) / 100.0) * new_bal
+                                state["precomputed_live_stake"] = round(max(1.0, min(new_stake, new_bal)) if new_bal >= 1.0 else 0.0, 2)
+
+                            save_state()
+                            _sync_active_trades_to_latest_data()
+                            await broadcast_state()
+
+                            msg = (f"LIVE trade FILLED via GTD limit (attempt #{attempt_num}): {side} ${fill_usd:.2f} on {trade['market_slug']} "
+                                   f"— {fill_size:.2f} shares @ {fill_price:.4f} (paper entry {trade['paper_entry_price']:.4f}, order {order_id})")
+                            log_message(msg)
+                            await send_telegram(f"🚀 *LIVE Copy FILLED (GTD Limit)*\n• Side: `{side}`\n• Fill Price: `{fill_price:.4f}`\n• Shares: `{fill_size:.2f}`\n• Amount: `${fill_usd:.2f}`\n• Market: `{trade['market_slug']}`")
+                            return
+
+                        # Check if partial fill happened while resting on book
+                        matched = ord_status.get("size_matched", 0.0)
+                        if matched > 0 and matched != trade.get("live_shares"):
+                            trade["live_shares"] = matched
+                            trade["live_entry_price"] = float(ord_status.get("price") or gtd_price)
+                            save_state()
+                            _sync_active_trades_to_latest_data()
+                            await broadcast_state()
+
+                        # Explicit cancellation confirmed from exchange
+                        if st == "CANCELLED":
+                            await handle_order_gone_quiet(order_id, trade, token_id, current_ask, gtd_price, "GTD")
+                            return
+
+                        # Check if market ask has surged above our resting limit price
+                        # If market jumped away, cancel early to re-quote at the higher price instead of waiting 4s passively
+                        if now_ts - order_placed_ts >= 1.5:
+                            ws_sum = polymarket_clob_ws.get_summary(token_id, max_age_s=5.0)
+                            ws_ask = ws_sum.get("bestAsk") if ws_sum else None
+                            if ws_ask and ws_ask > gtd_price:
+                                log_message(f"Market ask surged ({ws_ask:.4f} > limit {gtd_price:.4f}) — cancelling resting GTD early to re-quote at fresh ask...")
+                                filled = await handle_order_gone_quiet(order_id, trade, token_id, current_ask, gtd_price, "GTD")
+                                if filled:
+                                    return
+                                if attempt_num < max_attempts:
+                                    trade["live_status"] = "FILLING"
+                                    break
+
+                        # 4-Second Resting Lifetime (long shots: settings longshot.resting_s):
+                        # Enforce the full resting window. Once reached, cancel and verify all partial fills!
+                        if now_ts - order_placed_ts >= resting_s:
+                            log_message(f"Resting GTD order {order_id} reached {resting_s:g}s timeout — verifying fills and cancelling on exchange...")
+                            filled = await handle_order_gone_quiet(order_id, trade, token_id, current_ask, gtd_price, "GTD")
+                            if filled:
+                                return
+
+                            if attempt_num < max_attempts:
+                                log_message(f"Resting GTD order {order_id} cancelled on exchange — re-quoting at freshest ask (attempt #{attempt_num + 1})...")
+                                trade["live_status"] = "FILLING"
+                                break
+                            else:
+                                log_message(f"GTD order {order_id} cancelled on exchange after max attempts ({max_attempts}) — stopping order placement for this window to prevent duplicate entry.")
+                                trade["live_status"] = "CANCELLED"
+                                save_state()
+                                _sync_active_trades_to_latest_data()
+                                await broadcast_state()
+                                return
+
+                        await asyncio.sleep(0.5)
 
                 if trade.get("live_status") == "FILLED":
                     return
             else:
-                err = clob_trader.enrich_order_error(str(gtd_res.get("error", "gtd_placement_failed")))
+                err = clob_trader.enrich_order_error(str(gtd_res.get("error", f"{order_type.lower()}_placement_failed")))
                 if any(k in err for k in ("setup_failed", "client_not_ready", "invalid_private_key", "not enough balance", "balance is not enough")):
                     trade["live_status"] = "FAILED"
                     log_message(f"LIVE copy aborted: {err}")
@@ -1546,7 +1614,15 @@ async def _continuous_live_copy_fill(trade: Dict[str, Any], market: Dict[str, An
                     await broadcast_state()
                     return
 
-                log_message(f"LIVE copy attempt #{attempt_num} for {side} GTD placement failed: {err} — retrying in {int(retry_interval * 1000)}ms...")
+                if attempt_num < max_attempts:
+                    log_message(f"LIVE copy attempt #{attempt_num} for {side} {order_type} placement failed: {err} — retrying in {int(retry_interval * 1000)}ms...")
+                else:
+                    trade["live_status"] = "MISSED" if any(k in err.lower() for k in ("no orders found to match", "no matching orders", "order cancelled")) else "FAILED"
+                    log_message(f"LIVE copy {order_type} placement ended after max attempts ({max_attempts}): {err}")
+                    save_state()
+                    _sync_active_trades_to_latest_data()
+                    await broadcast_state()
+                    return
 
             await asyncio.sleep(retry_interval)
     finally:
@@ -1884,14 +1960,16 @@ async def _le_live_fak(trade: Dict[str, Any], keys: List[str], order_sent: Optio
             trade["live_status"] = "INSUFFICIENT_FUNDS"
             note = f"balance ${live_balance:.2f} is under the ${usd:.2f} minimum ({shares:g} shares @ {price:.3f})"
         else:
-            trade["live_status"] = "FAK_SENT"
+            ls_ot = longshot.order_type_for(cfg, "engine")
+            ls_ot = ls_ot if ls_ot in ("FAK", "FOK") else "FOK"
+            trade["live_status"] = f"{ls_ot}_SENT"
             trade["live_attempts"] = 1
             trade["live_limit_price"] = price
             trade["live_quoted_price"] = quoted
             trade["le_order_usd"] = usd
             trade["le_order_shares"] = shares
             t_send = time.perf_counter()
-            res = await clob_trader.place_limit_buy_async(token_id, shares, price, 0, longshot.tick_size_str(price), "FAK")
+            res = await clob_trader.place_limit_buy_async(token_id, shares, price, 0, longshot.tick_size_str(price), ls_ot)
             t_answer = time.perf_counter()
             send_ms = (t_answer - t_send) * 1000.0
             trade["le_answer_ms"] = round((t_answer - t_decision) * 1000.0, 1)
@@ -1930,7 +2008,9 @@ async def _le_live_fak(trade: Dict[str, Any], keys: List[str], order_sent: Optio
             _in_flight_markets.discard(k)
 
     st = trade.get("live_status")
-    head = (f"LONGSHOT engine LIVE order for {side} on {trade.get('market_slug')}: fill-and-kill"
+    ls_ot = longshot.order_type_for(cfg, "engine")
+    ls_ot = ls_ot if ls_ot in ("FAK", "FOK") else "FOK"
+    head = (f"LONGSHOT engine LIVE order for {side} on {trade.get('market_slug')}: {ls_ot.lower()}"
             + (f" {shares:g} shares at {float(trade['longshot']['max_price']):.3f} or better (${usd:.2f})" if usd else "")
             + f" (paper entry {float(trade.get('paper_entry_price') or 0.0):.4f})"
             + (f", Polymarket answered in {send_ms:.0f} ms" if send_ms is not None else "") + ": ")
