@@ -2070,6 +2070,14 @@ async def execute_trade(decision: Dict[str, Any], market_prices: Dict[str, Any],
                     or (window_start_ms is not None and t.get("window_start_ms") == int(window_start_ms)))
 
         if is_ls:
+            if longshot.require_regular_trade_on(ls_cfg):
+                has_reg = any(
+                    not _is_longshot(t) and _same_window(t)
+                    for t in (state.get("active_trades", []) + state.get("trade_history", []))
+                )
+                if not has_reg:
+                    log_message("LONGSHOT skipped: regular trade must happen before longshot in this window.")
+                    return "no_regular_trade"
             if longshot.one_at_a_time_on(ls_cfg):
                 # Exclusive mode: strictly ONE longshot strategy per window
                 has_any_ls = any(_is_longshot(t) and _same_window(t) for t in state["active_trades"])
@@ -3491,6 +3499,8 @@ def _ls_follow_sides(ctx: Dict[str, Any], spot: float, secs_left: float, mode: O
         bets = [t for t in list(state["active_trades"]) + list(state["trade_history"][-50:])
                 if not _is_longshot(t) and str(t.get("market_id")) == mid and t.get("side") in ("UP", "DOWN")]
         if not bets:
+            if not longshot.require_regular_trade_on(settings.LONGSHOT):
+                return None, "standalone (no GTD bet)"
             return [], "no GTD bet in this window"
         first = min(bets, key=lambda t: str(t.get("paper_entry_time") or ""))
         return [first["side"]], f"GTD bet {first['side']}"
@@ -3508,7 +3518,9 @@ def _ls_follow_sides(ctx: Dict[str, Any], spot: float, secs_left: float, mode: O
     if mode == "either":
         bet_sides, bet_why = _ls_follow_sides(ctx, spot, secs_left, "bet")
         pred_sides, pred_why = _ls_follow_sides(ctx, spot, secs_left, "prediction")
-        return sorted(set(bet_sides) | set(pred_sides)), f"{bet_why}, {pred_why}"
+        if bet_sides is None:
+            return (pred_sides if pred_sides else None), f"{bet_why}, {pred_why}"
+        return sorted(set(bet_sides) | set(pred_sides or [])), f"{bet_why}, {pred_why}"
     return None, "off"
 
 
@@ -3572,6 +3584,21 @@ async def evaluate_longshot(reason: str = "event"):
             one_at_a_time = longshot.one_at_a_time_on(cfg)
             maker_has_fill = False
             cur_start = int(ctx["start_ms"])
+            cur_mkt_id = str(ctx.get("market", {}).get("id") or "")
+            cur_slug = str(ctx.get("market", {}).get("slug") or "")
+            if longshot.require_regular_trade_on(cfg):
+                has_reg = any(
+                    not _is_longshot(t) and (
+                        (cur_mkt_id and str(t.get("market_id")) == cur_mkt_id)
+                        or (cur_slug and t.get("market_slug") == cur_slug)
+                        or (t.get("window_start_ms") == cur_start)
+                    )
+                    for t in (state.get("active_trades", []) + state.get("trade_history", []))
+                )
+                if not has_reg:
+                    await ls_maker_mgr.cancel_window(cur_start, "no_regular_trade")
+                    state["ls_last"] = {**status, "result": "waiting_regular_trade"}
+                    return
             if one_at_a_time:
                 ls_here = [t for t in state["active_trades"]
                            if _is_longshot(t) and (t.get("window_start_ms") == cur_start or str(t.get("market_id")) == str(ctx.get("market", {}).get("id")))]

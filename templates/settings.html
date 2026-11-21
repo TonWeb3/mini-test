@@ -139,6 +139,17 @@
                 </div>
 
                 <div class="space-y-4">
+                    <!-- Require Existing Regular Trade Toggle -->
+                    <div>
+                        <label class="flex items-center gap-3 bg-gray-700/80 border border-gray-600 rounded-lg p-3 text-white cursor-pointer hover:bg-gray-700 transition">
+                            <input type="checkbox" x-model="form.longshot.require_regular_trade" class="w-5 h-5 accent-blue-500 rounded">
+                            <div>
+                                <span class="font-bold text-sm text-blue-300">Require Existing Regular Trade</span>
+                                <p class="text-[11px] text-gray-400">ON = only enter longshots (Sniper, Maker, Engine) when a regular trade already exists in the current window. OFF = allow standalone longshots even when there is no regular trade.</p>
+                            </div>
+                        </label>
+                    </div>
+
                     <!-- Exclusive Mode Toggle -->
                     <div>
                         <label class="flex items-center gap-3 bg-gray-700/80 border border-gray-600 rounded-lg p-3 text-white cursor-pointer hover:bg-gray-700 transition">
@@ -467,6 +478,7 @@
                     capital_extractor: { enabled: false, trigger_balance: 2000, withdraw_amount: 1000, withdraw_address: '', auto_resume_after_withdrawal: true, resume_after: 'submitted', default_destination: '' },
                     telegram: { enabled: false, bot_token: '' },
                     longshot: {
+                        require_regular_trade: true,
                         one_at_a_time: true,
                         one_at_a_time_rule: 'taken',
                         sniper_enabled: true,

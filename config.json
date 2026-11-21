@@ -42,6 +42,7 @@
     "longshot_risk_value": 1.0
   },
   "longshot": {
+    "require_regular_trade": true,
     "one_at_a_time": true,
     "one_at_a_time_rule": "taken",
     "sniper_enabled": true,

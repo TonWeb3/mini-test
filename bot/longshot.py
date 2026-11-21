@@ -39,6 +39,7 @@ DEFAULTS: Dict[str, Any] = {
     "sniper_enabled": True,    # PATCH: longshot strategies — the final-minute sniper buys on/off
     "maker_enabled": True,     # PATCH: longshot strategies — the resting maker bids on/off
     "engine_enabled": True,    # PATCH: longshot engine — the GTD engine's own cheap entries as long shots (the paper bot's kind)
+    "require_regular_trade": True,  # True = only enter longshot when an existing regular trade exists in this window
     "one_at_a_time": True,     # only allow one longshot strategy to open per window
     "one_at_a_time_rule": "taken",
     "engine_max_price": 0.10,  # PATCH: longshot engine — a GTD entry at this ask or less is a long shot
@@ -151,7 +152,8 @@ def normalize(user_cfg: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     num(cfg, "engine_stake_pct", "engine long shots stake %", 0, 100)
     for key, label in (("sniper_enabled", "sniper"), ("maker_enabled", "maker bids"),
                        ("engine_enabled", "engine long shots"), ("engine_own_slot", "engine long shots own slot"),
-                       ("one_at_a_time", "one long shot at a time")):   # PATCH: longshot strategies (+ PATCH: longshot engine + exclusive mode)
+                       ("one_at_a_time", "one long shot at a time"),
+                       ("require_regular_trade", "require existing regular trade")):   # PATCH: longshot strategies (+ PATCH: longshot engine + exclusive mode)
         v = cfg.get(key, True)
         if isinstance(v, str):
             v = {"true": True, "on": True, "yes": True, "1": True,
@@ -234,13 +236,19 @@ def sniper_on(cfg: Dict[str, Any]) -> bool:
     return bool(cfg.get("sniper_enabled", True))
 
 
+def require_regular_trade_on(cfg: Optional[Dict[str, Any]]) -> bool:
+    """True when longshots require an existing regular trade in the current window."""
+    return bool((cfg or {}).get("require_regular_trade", True))
+
+
 def status_line(cfg: Dict[str, Any]) -> str:
     """PATCH: longshot strategies — the LONGSHOT log line: what runs, or off."""
+    req_txt = "require_regular_trade=on" if require_regular_trade_on(cfg) else "standalone allowed (require_regular_trade=off)"
     if not (sniper_on(cfg) or maker_on(cfg)):
         if engine_on(cfg):   # PATCH: longshot engine — the engine long shots run on their own
-            return "LONGSHOT: on — " + describe(cfg)
+            return f"LONGSHOT: on [{req_txt}] — " + describe(cfg)
         return "LONGSHOT: off (sniper and maker bids both switched off)"
-    return "LONGSHOT: on — " + describe(cfg)
+    return f"LONGSHOT: on [{req_txt}] — " + describe(cfg)
 
 
 # ── Engine long shots (PATCH: longshot engine) ────────────────────────────────
