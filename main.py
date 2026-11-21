@@ -18,7 +18,7 @@ if sys.platform != "win32":
 
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 import httpx
 
@@ -47,7 +47,7 @@ _ws_clients = set()
 # ── Event-driven early entries & wakeups ───────────────────────────────────────
 MIN_EVAL_INTERVAL_S = 0.0   # was 0.25 (at most 4 checks a second, so a tick could wait up to 250 ms); every tick is checked now
 CTX_MAX_AGE_S = 4.0        # 4.0s context validity from TOG-main
-POLY_WS_MAX_AGE_MS = 2500
+POLY_WS_MAX_AGE_MS = 10000
 MARK_CAPTURE_WINDOW_MS = 20_000
 
 _market_event = asyncio.Event()
@@ -540,6 +540,7 @@ def get_ws_symbol_filter(symbol: str) -> str:
     return s.lower()
 
 binance_stream = ws_data.BinanceTradeStream(symbol=settings.SYMBOL, on_update=_wake_entry)
+basis_tracker = indicators.BasisTracker(halflife_s=30.0)
 binance_kline_1m = ws_data.BinanceKlineStream(symbol=settings.SYMBOL, interval="1m", limit=240)
 binance_kline_5m = ws_data.BinanceKlineStream(symbol=settings.SYMBOL, interval="5m", limit=200)
 
@@ -606,22 +607,21 @@ def _ps_tol() -> float:
 
 
 def _ps_live_as_poly_ws(poly_ws: Dict[str, Any]) -> Dict[str, Any]:
-    """update_loop: with "prices" on, Polymarket's live Chainlink price from the price socket, in the shape of
-    the old Polymarket feed's last price — while it is fresh: it arrived, and is stamped, within
-    POLY_WS_MAX_AGE_MS. Otherwise poly_ws as it is (the bot then goes on with its other feeds, as before)."""
+    """update_loop: with "prices" on, Polymarket's live Chainlink price from the price socket,
+    using local receipt time (live_at) for freshness so small PC clock skew doesn't reject live ticks."""
     if not _ps_use("prices"):
         return poly_ws
     live = polybolt_feed.live(POLY_WS_MAX_AGE_MS / 1000.0)
     if not live:
         return poly_ws
     behind_ms = (time.time() - live[0]) * 1000.0
-    if behind_ms > POLY_WS_MAX_AGE_MS:
+    if behind_ms > 15000.0:
         if time.time() - _ps_lag_said[0] > 600:
             _ps_lag_said[0] = time.time()
             log_message(f"PRICE STREAM: its live price is stamped {behind_ms / 1000.0:.1f}s behind this computer's clock — "
-                        "not used as the bot's price (the bot keeps its own feed)")
-        return poly_ws
-    return {"price": live[1], "updatedAt": live[0] * 1000.0}
+                        "check PC clock sync (still using received feed while fresh)")
+    recv_ms = (polybolt_feed.live_at or time.time()) * 1000.0
+    return {"price": live[1], "updatedAt": live[0] * 1000.0, "receivedAt": recv_ms}
 
 
 def _ps_strike(start_ms: int, strike_open: Optional[float], strike_source: str):
@@ -1807,8 +1807,11 @@ async def _le_final_check(ctx: Dict[str, Any], reason: str, now: float):
     spot_price = binance_stream.get_last().get("price")
     if not spot_price:
         return
-    mc_steps = _model_steps(ctx["time_left_min"])
-    fair_up = indicators.fair_prob_up(spot_price, ctx["target_open"], mc_steps, ctx["sigma_5m"], drift_per_step=ctx["drift_5m"])
+    end_ts = ctx.get("end_ts")
+    tau_s = max(0.5, (float(end_ts) - now) if end_ts else (ctx["time_left_min"] * 60.0 - max(0.0, now - ctx.get("built_at", now))))
+    sigma_s = ctx.get("sigma_s")
+    model_spot = basis_tracker.adjust(spot_price, now) if ctx.get("use_basis") else spot_price
+    fair_up = indicators.fair_prob_up(model_spot, ctx["target_open"], tau_s, sigma_s)
     up_ws = polymarket_clob_ws.get_summary(ctx["token_ids"].get("up"), max_age_s=settings.MAX_BOOK_AGE_S)
     down_ws = polymarket_clob_ws.get_summary(ctx["token_ids"].get("down"), max_age_s=settings.MAX_BOOK_AGE_S)
     market_up = up_ws.get("bestAsk") if up_ws else None
@@ -1833,6 +1836,9 @@ async def _le_final_check(ctx: Dict[str, Any], reason: str, now: float):
         "rsi": ctx["rsi"],
         "haExhaustedGreen": ctx["ha_exhausted_green"],
         "haExhaustedRed": ctx["ha_exhausted_red"],
+        "impulse": binance_stream.get_impulse(engines.IMPULSE_LOOKBACK_S),
+        "spotPrice": spot_price,
+        "sigmaPerSqrtS": sigma_s,
     })
     market_prices = {"up": market_up, "down": market_down}
     if decision.get("action") != "ENTER" or _le_kind(decision, market_prices, mkt) != "longshot":
@@ -3198,6 +3204,8 @@ async def maybe_auto_withdraw(equity: float, poly_snapshot: Dict[str, Any]):
     if not settings.AUTO_WITHDRAW_ENABLED:
         state["withdraw_state"] = "idle"
         return
+    if (getattr(settings, "MODE", "paper") or "paper").lower() == "paper":
+        return
     if not settings.PRIVATE_KEY:
         return
     raw_dest = (settings.WITHDRAW_ADDRESS or "").strip()
@@ -3393,10 +3401,11 @@ async def evaluate_entry(reason: str = "event"):
         if not spot_price:
             return
 
-        mc_steps = _model_steps(ctx["time_left_min"])
-        fair_up = indicators.fair_prob_up(
-            spot_price, ctx["target_open"], mc_steps, ctx["sigma_5m"], drift_per_step=ctx["drift_5m"]
-        )
+        ctx_end_ts = ctx.get("end_ts")
+        tau_s = max(0.5, (float(ctx_end_ts) - now) if ctx_end_ts else (ctx["time_left_min"] * 60.0 - max(0.0, now - ctx.get("built_at", now))))
+        sigma_s = ctx.get("sigma_s")
+        model_spot = basis_tracker.adjust(spot_price, now) if ctx.get("use_basis") else spot_price
+        fair_up = indicators.fair_prob_up(model_spot, ctx["target_open"], tau_s, sigma_s)
 
         market_up = ctx["prices"]["up"]
         market_down = ctx["prices"]["down"]
@@ -3417,6 +3426,9 @@ async def evaluate_entry(reason: str = "event"):
             "rsi": ctx["rsi"],
             "haExhaustedGreen": ctx["ha_exhausted_green"],
             "haExhaustedRed": ctx["ha_exhausted_red"],
+            "impulse": binance_stream.get_impulse(engines.IMPULSE_LOOKBACK_S),
+            "spotPrice": spot_price,
+            "sigmaPerSqrtS": sigma_s,
         })
 
         # PATCH: longshot engine — a window whose regular slot is taken may only enter a long shot
@@ -3483,8 +3495,11 @@ def _ls_follow_sides(ctx: Dict[str, Any], spot: float, secs_left: float, mode: O
         first = min(bets, key=lambda t: str(t.get("paper_entry_time") or ""))
         return [first["side"]], f"GTD bet {first['side']}"
     if mode == "prediction":
-        fair_up = indicators.fair_prob_up(spot, ctx.get("target_open"), _model_steps(secs_left / 60.0),
-                                          ctx.get("sigma_5m"), drift_per_step=ctx.get("drift_5m") or 0.0)
+        sigma_s = ctx.get("sigma_s")
+        if sigma_s is None and ctx.get("sigma_5m"):
+            sigma_s = float(ctx["sigma_5m"]) / math.sqrt(300.0)
+        model_spot = basis_tracker.adjust(spot) if ctx.get("use_basis") else spot
+        fair_up = indicators.fair_prob_up(model_spot, ctx.get("target_open"), max(0.5, float(secs_left)), sigma_s)
         if fair_up > 0.5:
             return ["UP"], f"GTD prediction UP {fair_up:.1%}"
         if fair_up < 0.5:
@@ -3838,7 +3853,7 @@ async def update_loop():
             current_price = None
             price_source = None
             price_is_fresh = True
-            poly_updated = poly_ws.get("updatedAt") or 0
+            poly_updated = poly_ws.get("receivedAt") or poly_ws.get("updatedAt") or 0
             if poly_ws.get("price"):
                 current_price = poly_ws["price"]
                 price_source = "Polymarket WS"
@@ -3903,7 +3918,11 @@ async def update_loop():
                     model_open = c["open"]
                     break
             model_open = model_open or win.get("binance") or spot_price
-            target_open = model_open if strike_open is not None else None
+            if spot_price and current_price and price_is_fresh:
+                basis_tracker.update(spot_price, current_price)
+            use_basis = basis_tracker.ready()
+            model_spot = basis_tracker.adjust(spot_price) if use_basis else spot_price
+            target_open = (strike_open if use_basis else model_open) if strike_open is not None else None
 
             settlement_ms = None
             if poly_snapshot.get("ok") and poly_snapshot.get("market") and poly_snapshot["market"].get("endDate"):
@@ -3961,16 +3980,19 @@ async def update_loop():
             ha_exhausted_red = _is(consec["color"], consec["count"], "red") or _is(consec_5m["color"], consec_5m["count"], "red")
 
             since_start = (time.time() * 1000) - start_ms
+            tau_s = max(0.5, (settlement_ms - time.time() * 1000.0) / 1000.0) if settlement_ms is not None else max(0.5, timing["remainingMs"] / 1000.0)
+            sigma_s = (indicators.ewma_vol_per_sqrt_s(klines_1m, span=30, bar_seconds=60.0)
+                       or indicators.ewma_vol_per_sqrt_s(klines_5m, span=12, bar_seconds=300.0))
+            sigma_5m = (sigma_s * math.sqrt(300.0)) if sigma_s else None
+            drift_5m = 0.0
             if strike_open is None or target_open is None:
                 fair_up = 0.50
-                drift_5m, sigma_5m = (0.0, None)
                 if since_start < MARK_CAPTURE_WINDOW_MS:
                     decision = {"action": "NO_TRADE", "side": None, "phase": "EV", "strength": "EV", "reason": "waiting_new_window_strike"}
                 else:
                     decision = {"action": "NO_TRADE", "side": None, "phase": "EV", "strength": "EV", "reason": "no_strike_window_skipped"}
             else:
-                drift_5m, sigma_5m = indicators.realized_drift_vol(klines_5m, lookback=300)
-                fair_up = indicators.fair_prob_up(spot_price or 0, target_open, mc_steps, sigma_5m, drift_per_step=drift_5m or 0.0)
+                fair_up = indicators.fair_prob_up(model_spot or 0, target_open, tau_s, sigma_s)
                 decision = engines.decide_ev({
                     "mcProbUp": fair_up,
                     "priceUp": market_up,
@@ -3980,13 +4002,16 @@ async def update_loop():
                     "rsi": rsi_now,
                     "haExhaustedGreen": ha_exhausted_green,
                     "haExhaustedRed": ha_exhausted_red,
+                    "impulse": binance_stream.get_impulse(engines.IMPULSE_LOOKBACK_S),
+                    "spotPrice": spot_price,
+                    "sigmaPerSqrtS": sigma_s,
                 })
 
             fair_data = {
                 "prob_up": fair_up,
                 "prob_down": 1.0 - fair_up,
                 "bias": "BULLISH" if fair_up > 0.6 else "BEARISH" if fair_up < 0.4 else "NEUTRAL",
-                "steps": mc_steps,
+                "tau_s": round(tau_s, 1),
                 "sigma_5m": sigma_5m,
             }
 
@@ -4023,11 +4048,13 @@ async def update_loop():
                     "end_ts": mkt_end_ts,
                     "start_ms": start_ms,
                     "target_open": target_open,
+                    "use_basis": use_basis,
                     "strike_open": strike_open,
                     "strike_source": strike_source,
                     "time_left_min": time_left_min,
+                    "sigma_s": sigma_s,
                     "sigma_5m": sigma_5m,
-                    "drift_5m": drift_5m or 0.0,
+                    "drift_5m": 0.0,
                     "rsi": rsi_now,
                     "ha_exhausted_green": ha_exhausted_green,
                     "ha_exhausted_red": ha_exhausted_red,
@@ -4056,8 +4083,8 @@ async def update_loop():
                 if ls_end - time.time() > longshot.eval_cutoff_s(settings.LONGSHOT):  # PATCH: longshot maker
                     ls_ctx = {
                         "built_at": time.time(), "end_ts": ls_end, "start_ms": start_ms,
-                        "strike_open": strike_open, "strike_source": strike_source, "target_open": target_open,
-                        "sigma_5m": sigma_5m, "drift_5m": drift_5m or 0.0,
+                        "strike_open": strike_open, "strike_source": strike_source, "target_open": target_open, "use_basis": use_basis,
+                        "sigma_s": sigma_s, "sigma_5m": sigma_5m, "drift_5m": 0.0,
                         "prices": poly_snapshot.get("prices", {}), "token_ids": poly_snapshot.get("token_ids", {}),
                         "orderbook": poly_snapshot.get("orderbook", {}), "market": poly_snapshot["market"],
                     }
@@ -4285,6 +4312,31 @@ async def order_conn_keeper():
         except Exception:
             await asyncio.sleep(5.0)
 
+def _log_active_toggles(tag: str = "STARTUP") -> None:
+    mode = (getattr(settings, "MODE", "paper") or "paper").upper()
+    risk_unit = "%" if str(settings.RISK_TYPE).lower() == "percent" else " USD fixed"
+    creds = "key loaded" if settings.PRIVATE_KEY else "no key"
+    flip_txt = (f"on (conv>={settings.FLIP_MIN_CONVICTION*100:.0f}%, >={settings.FLIP_MIN_MINUTES_LEFT:g}m left)"
+                if settings.FLIP_ENABLED else "off")
+    ce_txt = (f"on (trigger ${settings.WITHDRAW_TRIGGER_BALANCE:g}, withdraw ${settings.WITHDRAW_AMOUNT:g}, "
+              f"auto_resume={'on' if settings.WITHDRAW_AUTO_RESUME else 'off'})"
+              if settings.AUTO_WITHDRAW_ENABLED else "off")
+    tg_txt = "on" if settings.TELEGRAM_ENABLED else "off"
+
+    log_message(f"══ ACTIVE CONFIG [{tag}] ══")
+    log_message(f"CORE: mode={mode} ({creds}) | {settings.SYMBOL} {settings.CANDLE_WINDOW_MINUTES}m | "
+                f"risk={settings.RISK_VALUE:g}{risk_unit}")
+    log_message(f"MODEL: zero-drift continuous tau_s + EWMA vol + basis-adjusted spot vs TWAP strike + "
+                f"Binance {engines.IMPULSE_LOOKBACK_S:g}s impulse gate")
+    log_message(f"EV: threshold>={settings.EV_THRESHOLD*100:g}¢ | min_prob>={settings.MIN_PROB_EV*100:g}% | "
+                f"min_liq>=${settings.MIN_BOOK_LIQUIDITY_USD:g}")
+    log_message(longshot.status_line(settings.LONGSHOT))
+    log_message(copy_fak.status_line(settings.COPY_FAK))
+    log_message(f"PROTECTION: flip={flip_txt} | capital_extractor={ce_txt} | telegram={tg_txt}")
+    log_message(polybolt.status_line(settings.PRICE_STREAM))
+    log_message(_or_status_line())
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     load_state()
@@ -4317,9 +4369,7 @@ async def lifespan(app: FastAPI):
     tasks.append(asyncio.create_task(ls_maker_mgr.run_forever()))  # PATCH: longshot maker
     tasks.append(asyncio.create_task(_or_watch_forever()))  # PATCH: official results
     tasks.append(asyncio.create_task(polybolt_feed.run_forever()))  # PATCH: price stream — it connects only while switched on
-    log_message(polybolt.status_line(settings.PRICE_STREAM))   # PATCH: price stream
-    log_message(_or_status_line())   # PATCH: official results
-    log_message(longshot.status_line(settings.LONGSHOT))   # PATCH: longshot strategies — on (and what runs) or off
+    _log_active_toggles("STARTUP")
 
 
     # Pre-warm CLOB trader client & on-chain verification in background thread if private key set
@@ -4443,7 +4493,27 @@ async def download_file(key: str):
         return JSONResponse({"error": "not_generated_yet", "path": path}, status_code=404)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     base, ext = os.path.splitext(os.path.basename(path))
-    return FileResponse(path, media_type=media, filename=f"15m-{base}-{stamp}{ext}")
+    dl_name = f"15m-{base}-{stamp}{ext}"
+    snapshot_size = os.path.getsize(path)
+
+    def _iter_snapshot():
+        remaining = snapshot_size
+        with open(path, "rb") as f:
+            while remaining > 0:
+                chunk = f.read(min(65536, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                yield chunk
+
+    return StreamingResponse(
+        _iter_snapshot(),
+        media_type=media,
+        headers={
+            "Content-Disposition": f'attachment; filename="{dl_name}"',
+            "Cache-Control": "no-store",
+        },
+    )
 
 def _reflect_running_now():
     ts = state["latest_data"].get("trading_state")
@@ -4455,6 +4525,7 @@ async def start_trading():
     state["running"] = True
     _reflect_running_now()
     log_message("Trading STARTED by user")
+    _log_active_toggles("STARTED")
     await send_telegram("🟢 *Trading STARTED by user*")
     await broadcast_state()
     return {"ok": True, "running": True}
@@ -4726,6 +4797,12 @@ async def post_settings(new_settings: Dict[str, Any]):
     if _new_signer:
         settings.ORDER_SIGNER = _new_signer
 
+    if isinstance(new_settings.get("telegram"), dict):
+        tg_in = new_settings["telegram"]
+        tg_tok = tg_in.get("bot_token")
+        if tg_tok and "..." in str(tg_tok):
+            tg_in["bot_token"] = settings.TELEGRAM_BOT_TOKEN
+
 
 
     cfg_file = CONFIG_PATH if os.path.exists(CONFIG_PATH) else "config.json"
@@ -4938,6 +5015,7 @@ async def post_settings(new_settings: Dict[str, Any]):
     polybolt_feed.wake()                                             # wake immediately if key or price_stream changed
 
     if settings.SYMBOL != old_symbol:
+        basis_tracker.reset()
         binance_stream.close()
         binance_stream = ws_data.BinanceTradeStream(symbol=settings.SYMBOL, on_update=_wake_entry)
         asyncio.create_task(binance_stream.start())
@@ -4969,6 +5047,7 @@ async def post_settings(new_settings: Dict[str, Any]):
     # set it up again first (several network calls). With the one-order copy on, set it up now.
     if settings.PRIVATE_KEY and copy_fak.on(settings.COPY_FAK):
         asyncio.create_task(asyncio.to_thread(clob_trader.ensure_ready))
+    _log_active_toggles("SETTINGS SAVED")
     await broadcast_state()
     return {"status": "ok"}
 

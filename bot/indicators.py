@@ -68,8 +68,7 @@ def count_consecutive(ha_candles: List[Dict]) -> Dict:
 
 
 def realized_drift_vol(candles: List[Dict], lookback: int = 300):
-    """(mean, std) of per-candle log returns — the per-step drift & sigma for the
-    fair-prob model. Returns (None, None) if there isn't enough data."""
+    """(mean, std) of per-candle log returns. Returns (None, None) if there isn't enough data."""
     closes = [c["close"] for c in candles[-lookback:] if c.get("close")]
     if len(closes) < 20:
         return None, None
@@ -81,23 +80,93 @@ def realized_drift_vol(candles: List[Dict], lookback: int = 300):
     return float(np.mean(rets)), float(np.std(rets))
 
 
-def fair_prob_up(current_price: float, strike: float, steps: int,
-                 sigma_per_step: Optional[float], drift_per_step: float = 0.0) -> float:
-    """Closed-form GBM probability that price closes ABOVE `strike` after `steps`
-    5-minute intervals — the core direction/edge model. The model is just
-    persistence: "is spot above the open, given the volatility still to come?"
-    Returns 0..1.
+def ewma_vol_per_sqrt_s(candles: List[Dict], span: int = 30, bar_seconds: float = 60.0) -> Optional[float]:
+    """Short-horizon RiskMetrics EWMA volatility scaled to per-sqrt-second."""
+    if not candles or bar_seconds <= 0:
+        return None
+    max_bars = max(120, int(span) * 4)
+    closes = [float(c["close"]) for c in candles[-max_bars:] if c.get("close") and float(c["close"]) > 0]
+    if len(closes) < 12:
+        return None
+    arr = np.asarray(closes, dtype=float)
+    rets = np.diff(np.log(arr))
+    rets = rets[np.isfinite(rets)]
+    if len(rets) < 10:
+        return None
+    alpha = 2.0 / (max(2, int(span)) + 1.0)
+    lam = 1.0 - alpha
+    init_n = min(10, len(rets))
+    var = float(np.mean(rets[:init_n] ** 2))
+    for r in rets[init_n:]:
+        var = lam * var + alpha * float(r * r)
+    if var <= 0.0:
+        return None
+    return float(math.sqrt(var) / math.sqrt(float(bar_seconds)))
+
+
+def fair_prob_up(current_price: float, strike: float, tau_s: float,
+                 sigma_per_sqrt_s: Optional[float]) -> float:
+    """Zero-drift continuous-time GBM probability that price closes ABOVE `strike`
+    after `tau_s` remaining seconds:
+        z = ln(spot / strike) / (sigma * sqrt(tau_s))
+        P(S_T > K) = Phi(z) = 0.5 * erfc(-z / sqrt(2))
     """
     if not current_price or not strike or current_price <= 0 or strike <= 0:
         return 0.5
-    # PATCH: longshot — a float `steps` (settings model.time_mode = "exact") is used as-is,
-    # so 40 seconds left is 0.133 steps. An int keeps the original whole-step clock.
-    n = max(float(steps), 1e-4) if isinstance(steps, float) else max(1, int(steps))
-    if sigma_per_step is None or sigma_per_step <= 0:
-        return 1.0 if current_price > strike else 0.0
-    mu = (drift_per_step - 0.5 * sigma_per_step ** 2) * n
-    sd = sigma_per_step * math.sqrt(n)
-    # P(S * exp(X) > K) for X ~ N(mu, sd^2)  ->  1 - Phi(z)  ->  0.5 * erfc(z/sqrt2)
-    z = (math.log(strike / current_price) - mu) / sd
-    prob = 0.5 * math.erfc(z / math.sqrt(2))
+    tau = max(float(tau_s), 0.5)
+    if sigma_per_sqrt_s is None or sigma_per_sqrt_s <= 0:
+        return 1.0 if current_price > strike else (0.5 if current_price == strike else 0.0)
+    sd = float(sigma_per_sqrt_s) * math.sqrt(tau)
+    if sd <= 0:
+        return 1.0 if current_price > strike else (0.5 if current_price == strike else 0.0)
+    z = math.log(current_price / strike) / sd
+    prob = 0.5 * math.erfc(-z / math.sqrt(2.0))
     return float(min(1.0, max(0.0, prob)))
+
+
+class BasisTracker:
+    """Tracks the smoothed live spread (binance_spot - chainlink_live) via a
+    time-weighted EMA so fast Binance ticks can be mapped onto Chainlink's exact
+    price scale and compared directly against Polymarket's TWAP strike_open."""
+
+    def __init__(self, halflife_s: float = 30.0, max_age_s: float = 120.0):
+        self.halflife_s = float(halflife_s)
+        self.max_age_s = float(max_age_s)
+        self.value: Optional[float] = None
+        self.last_ts: float = 0.0
+
+    def reset(self) -> None:
+        self.value = None
+        self.last_ts = 0.0
+
+    def ready(self, now: Optional[float] = None) -> bool:
+        if self.value is None:
+            return False
+        t = time.time() if now is None else float(now)
+        return (t - self.last_ts) <= self.max_age_s
+
+    def update(self, binance_spot: Optional[float], chainlink_live: Optional[float],
+               now: Optional[float] = None) -> Optional[float]:
+        if not binance_spot or not chainlink_live or binance_spot <= 0 or chainlink_live <= 0:
+            return self.value
+        raw = float(binance_spot) - float(chainlink_live)
+        if abs(raw) > 0.02 * float(chainlink_live):
+            return self.value
+        t = time.time() if now is None else float(now)
+        if self.value is None or (t - self.last_ts) > self.max_age_s:
+            self.value = raw
+        else:
+            dt = max(0.0, t - self.last_ts)
+            if dt > 0.0:
+                alpha = 1.0 - math.exp(-math.log(2.0) * dt / self.halflife_s)
+                self.value = (1.0 - alpha) * self.value + alpha * raw
+        self.last_ts = t
+        return self.value
+
+    def adjust(self, binance_spot: Optional[float], now: Optional[float] = None) -> Optional[float]:
+        if not binance_spot or binance_spot <= 0:
+            return binance_spot
+        if self.ready(now):
+            adj = float(binance_spot) - float(self.value)
+            return adj if adj > 0 else float(binance_spot)
+        return float(binance_spot)
